@@ -1,0 +1,16 @@
+.env
+*.pyc
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.log
+data/parquet/
+*.parquet
+.DS_Store
+Thumbs.db

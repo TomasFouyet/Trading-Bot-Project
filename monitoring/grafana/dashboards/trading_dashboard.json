@@ -1,0 +1,82 @@
+{
+  "title": "Trading Bot Dashboard",
+  "uid": "trading-bot-mvp",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Portfolio Equity (USDT)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "portfolio_equity_usdt", "legendFormat": "{{mode}}"}]
+    },
+    {
+      "id": 2,
+      "title": "Daily PnL (USDT)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "daily_pnl_usdt", "legendFormat": "{{mode}}"}]
+    },
+    {
+      "id": 3,
+      "title": "Daily Drawdown %",
+      "type": "gauge",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "daily_drawdown_pct", "legendFormat": "{{mode}}"}],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": 0},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 2}
+            ]
+          },
+          "max": 5
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Total Trades",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "trades_total", "legendFormat": "{{symbol}} {{mode}}"}]
+    },
+    {
+      "id": 5,
+      "title": "Trade PnL Distribution",
+      "type": "histogram",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{"expr": "rate(trade_pnl_usdt_bucket[5m])", "legendFormat": "{{le}}"}]
+    },
+    {
+      "id": 6,
+      "title": "Signals per Minute",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{"expr": "rate(trading_signals_total[1m])", "legendFormat": "{{action}}"}]
+    },
+    {
+      "id": 7,
+      "title": "API Latency (p99)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(broker_api_latency_seconds_bucket[5m]))",
+          "legendFormat": "p99 {{endpoint}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "API Errors",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [{"expr": "rate(broker_api_errors_total[1m])", "legendFormat": "{{error_type}}"}]
+    }
+  ]
+}

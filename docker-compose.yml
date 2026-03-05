@@ -1,0 +1,199 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trading Bot — full-stack docker-compose
+# Services: api, worker, redis, postgres, prometheus, grafana
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common-env: &common-env
+  DATABASE_URL: postgresql+asyncpg://trading:trading@postgres:5432/trading
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  PARQUET_DIR: /app/data/parquet
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  ENVIRONMENT: production
+
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading
+      POSTGRES_DB: trading
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI ───────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+    volumes:
+      - parquet_data:/app/data/parquet
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Celery Worker (data + compute queues) ────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: >
+      celery -A app.tasks.celery_app worker
+      --loglevel=info
+      --queues=data,compute
+      --concurrency=2
+      --hostname=worker-compute@%h
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+    volumes:
+      - parquet_data:/app/data/parquet
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Celery Worker (trading queue — single concurrency for safety) ─────────
+  worker-trading:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: >
+      celery -A app.tasks.celery_app worker
+      --loglevel=info
+      --queues=trading
+      --concurrency=1
+      --hostname=worker-trading@%h
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+    volumes:
+      - parquet_data:/app/data/parquet
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Celery Beat (optional scheduled tasks) ───────────────────────────────
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: >
+      celery -A app.tasks.celery_app beat
+      --loglevel=info
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+    depends_on:
+      - redis
+
+  # ── Flower (Celery monitoring) ───────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: >
+      celery -A app.tasks.celery_app flower
+      --port=5555
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+
+  # ── Prometheus ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  parquet_data:
+  prometheus_data:
+  grafana_data:
