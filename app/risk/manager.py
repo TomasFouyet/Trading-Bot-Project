@@ -65,9 +65,11 @@ class RiskManager:
         self._max_api_errors = max_consecutive_api_errors or _settings.risk_max_consecutive_api_errors
         self._state = RiskState()
 
-    def initialize(self, equity: Decimal) -> None:
-        """Call once at session start with current portfolio equity."""
-        today = date.today()
+    def initialize(self, equity: Decimal, as_of_date: date | None = None) -> None:
+        """Call once at session start with current portfolio equity.
+        Pass as_of_date in backtest mode so daily resets use bar dates correctly.
+        """
+        today = as_of_date or date.today()
         self._state.session_start_equity = equity
         self._state.current_equity = equity
         self._state.daily_start_equity = equity
@@ -79,15 +81,21 @@ class RiskManager:
             max_position_pct=str(self._max_position_pct),
         )
 
-    def update_equity(self, equity: Decimal) -> None:
-        """Update current equity (call after each bar mark-to-market)."""
-        today = date.today()
+    def update_equity(self, equity: Decimal, as_of_date: date | None = None) -> None:
+        """Update current equity (call after each bar mark-to-market).
+        Pass as_of_date in backtest mode to use bar date instead of wall-clock date.
+        """
+        today = as_of_date or date.today()
         if today > self._state.last_reset_date:
             # New trading day — reset daily counters
             self._state.daily_start_equity = equity
             self._state.daily_pnl = Decimal("0")
             self._state.trades_today = 0
             self._state.last_reset_date = today
+            # Reset kill switch if it was triggered only by daily drawdown (auto-recoverable)
+            if self._state.kill_switch_active and "Daily drawdown" in self._state.kill_switch_reason:
+                self._state.kill_switch_active = False
+                self._state.kill_switch_reason = ""
             logger.info("risk_daily_reset", equity=str(equity))
 
         self._state.current_equity = equity

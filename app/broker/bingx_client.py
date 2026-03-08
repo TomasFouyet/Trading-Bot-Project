@@ -411,6 +411,17 @@ class BingXClient:
             return [data["balance"]] if isinstance(data["balance"], dict) else data["balance"]
         return data if isinstance(data, list) else []
 
+    async def get_contracts(self) -> list[dict]:
+        """
+        Fetch all available perpetual swap contracts from BingX.
+        Endpoint: GET /openApi/swap/v2/quote/contracts
+        Returns list of contract info dicts (symbol, size, tickSize, etc.)
+        """
+        data = await self._request_with_retry(
+            "GET", "/openApi/swap/v2/quote/contracts", params={}
+        )
+        return data if isinstance(data, list) else []
+
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
         """Set leverage for a perpetual swap symbol."""
         sym = normalize_symbol(symbol)

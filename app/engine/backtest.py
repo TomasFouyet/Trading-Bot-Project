@@ -29,6 +29,7 @@ import pandas as pd
 from app.broker.backtest_adapter import BacktestAdapter
 from app.broker.base import OHLCVBar, OrderRequest, OrderSide, OrderType, TradeSide
 from app.config import get_settings
+from app.core.exceptions import KillSwitchTriggered
 from app.core.logging import get_logger
 from app.data.parquet_store import ParquetStore
 from app.risk.manager import RiskManager
@@ -148,7 +149,7 @@ class BacktestEngine:
             commission_rate=self._commission,
             slippage_rate=self._slippage,
         )
-        self._risk.initialize(self._initial_balance)
+        self._risk.initialize(self._initial_balance, as_of_date=bars[0].ts.date())
 
         result = BacktestResult(
             run_id=run_id,
@@ -246,7 +247,12 @@ class BacktestEngine:
             # 4. Risk validation
             balances = await adapter.get_balance()
             equity = balances[0].total if balances else self._initial_balance
-            self._risk.update_equity(equity)
+            try:
+                self._risk.update_equity(equity, as_of_date=bar.ts.date())
+            except KillSwitchTriggered:
+                # Daily drawdown limit hit — skip trading this bar (resets next day)
+                result.equity_curve.append({"ts": bar.ts, "equity": equity})
+                continue
 
             try:
                 approved, reason = self._risk.validate_signal(signal, equity)

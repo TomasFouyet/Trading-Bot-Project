@@ -30,18 +30,36 @@ async def main(args: argparse.Namespace) -> None:
 
     from app.data.parquet_store import ParquetStore
     from app.engine.backtest import BacktestEngine
-    from app.strategy.ema_cross import EMACrossStrategy
+    from app.strategy import get_strategy
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
     end = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
 
-    strategy_params = {
-        "ema_fast": args.ema_fast,
-        "ema_slow": args.ema_slow,
-        "sma_trend": args.sma_trend,
-    }
+    # Build strategy params depending on chosen strategy
+    if args.strategy == "ema_cross":
+        strategy_params = {
+            "ema_fast": args.ema_fast,
+            "ema_slow": args.ema_slow,
+            "sma_trend": args.sma_trend,
+        }
+    elif args.strategy == "rsi_divergence":
+        strategy_params = {
+            "rsi_period": args.rsi_period,
+            "ema_period": args.ema_period,
+            "swing_window": args.swing_window,
+            "swing_separation": args.swing_separation,
+            "swing_lookback": args.swing_lookback,
+            "trigger_window": args.trigger_window,
+            "rsi_oversold": args.rsi_oversold,
+            "rsi_overbought": args.rsi_overbought,
+            "allow_short": args.allow_short,
+            "sl_buffer_pct": args.sl_buffer_pct,
+            "rr_ratio": args.rr_ratio,
+        }
+    else:
+        strategy_params = {}
 
-    strategy = EMACrossStrategy(symbol=args.symbol, params=strategy_params)
+    strategy = get_strategy(args.strategy, symbol=args.symbol, params=strategy_params)
     store = ParquetStore()
 
     min_ts, max_ts = store.get_date_range(args.symbol, args.timeframe)
@@ -53,7 +71,7 @@ async def main(args: argparse.Namespace) -> None:
 
     print(f"\nData available: {min_ts} → {max_ts}")
     print(f"Running backtest: {args.symbol} {args.timeframe} | {start.date()} → {end.date()}")
-    print(f"Strategy: EMA{args.ema_fast}/EMA{args.ema_slow} + SMA{args.sma_trend}")
+    print(f"Strategy: {strategy.strategy_id}")
     print(f"Initial balance: ${args.balance:,.2f}\n")
 
     engine = BacktestEngine(
@@ -91,14 +109,33 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a trading strategy backtest")
     parser.add_argument("--symbol", default="BTC-USDT")
     parser.add_argument("--timeframe", default="5m")
-    parser.add_argument("--start", default="2024-01-01")
-    parser.add_argument("--end", default="2024-06-01")
+    parser.add_argument("--start", default="2025-11-20")
+    parser.add_argument("--end", default="2026-03-06")
     parser.add_argument("--balance", type=float, default=10000.0)
-    parser.add_argument("--ema-fast", type=int, default=20, dest="ema_fast")
-    parser.add_argument("--ema-slow", type=int, default=50, dest="ema_slow")
-    parser.add_argument("--sma-trend", type=int, default=200, dest="sma_trend")
+    parser.add_argument("--strategy", default="ema_cross",
+                        choices=["ema_cross", "rsi_divergence"],
+                        help="Strategy to backtest")
     parser.add_argument("--commission-bps", type=float, default=7.5, dest="commission_bps")
     parser.add_argument("--slippage-bps", type=float, default=5.0, dest="slippage_bps")
     parser.add_argument("--output", default=None, help="Save full JSON report to file")
+
+    # EMA Cross params
+    parser.add_argument("--ema-fast", type=int, default=20, dest="ema_fast")
+    parser.add_argument("--ema-slow", type=int, default=50, dest="ema_slow")
+    parser.add_argument("--sma-trend", type=int, default=200, dest="sma_trend")
+
+    # RSI Divergence params
+    parser.add_argument("--rsi-period", type=int, default=9, dest="rsi_period")
+    parser.add_argument("--ema-period", type=int, default=14, dest="ema_period")
+    parser.add_argument("--swing-window", type=int, default=5, dest="swing_window")
+    parser.add_argument("--swing-separation", type=int, default=10, dest="swing_separation")
+    parser.add_argument("--swing-lookback", type=int, default=100, dest="swing_lookback")
+    parser.add_argument("--trigger-window", type=int, default=10, dest="trigger_window")
+    parser.add_argument("--rsi-oversold", type=float, default=30.0, dest="rsi_oversold")
+    parser.add_argument("--rsi-overbought", type=float, default=70.0, dest="rsi_overbought")
+    parser.add_argument("--allow-short", action="store_true", default=True, dest="allow_short")
+    parser.add_argument("--sl-buffer-pct", type=float, default=0.003, dest="sl_buffer_pct")
+    parser.add_argument("--rr-ratio", type=float, default=1.5, dest="rr_ratio")
+
     args = parser.parse_args()
     asyncio.run(main(args))
