@@ -14,6 +14,11 @@ Flow:
   5. Compute metrics, save BacktestRun to DB
 
 Market orders are filled on the NEXT bar's open (realistic simulation).
+
+PARTIAL_CLOSE support:
+  - When signal.action == PARTIAL_CLOSE, close signal.close_pct of position
+  - Remaining qty stays in open_trade with updated fees
+  - Final CLOSE closes whatever remains
 """
 from __future__ import annotations
 
@@ -67,9 +72,10 @@ class BacktestResult:
     trades: list[dict] = field(default_factory=list)
     equity_curve: list[dict] = field(default_factory=list)
     signals: list[dict] = field(default_factory=list)
+    bar_data: list[dict] = field(default_factory=list)  # verbose mode only
 
     def to_report(self) -> dict:
-        return {
+        report = {
             "run_id": self.run_id,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
@@ -96,11 +102,18 @@ class BacktestResult:
                 for e in self.equity_curve
             ],
         }
+        if self.bar_data:
+            report["bar_data"] = self.bar_data
+        return report
 
 
 class BacktestEngine:
     """
     Deterministic single-symbol backtest engine.
+
+    Supports BUY, SELL, CLOSE, and PARTIAL_CLOSE signals.
+    PARTIAL_CLOSE closes a fraction of the position (specified in signal.meta["close_pct"])
+    and records a partial trade. The remaining position continues with the original entry price.
     """
 
     def __init__(
@@ -110,6 +123,7 @@ class BacktestEngine:
         initial_balance: Decimal = Decimal("10000"),
         commission_rate: Decimal | None = None,
         slippage_rate: Decimal | None = None,
+        verbose: bool = False,
     ) -> None:
         self._strategy = strategy
         self._store = store
@@ -117,6 +131,7 @@ class BacktestEngine:
         self._commission = commission_rate or _settings.commission_rate
         self._slippage = slippage_rate or _settings.slippage_rate
         self._risk = RiskManager()
+        self._verbose = verbose
 
     async def run(
         self,
@@ -165,6 +180,8 @@ class BacktestEngine:
         open_trade: dict | None = None
         pending_order_id: str | None = None
         close_order_id: str | None = None
+        partial_close_order_id: str | None = None   # NEW: track partial close orders
+        partial_close_pct: float = 0.0               # NEW: % being closed
         bars_in_position = 0
         total_bars = len(bars)
 
@@ -183,43 +200,100 @@ class BacktestEngine:
                         "entry_ts": fill.timestamp,
                         "entry_price": fill.price,
                         "qty": fill.qty,
+                        "original_qty": fill.qty,   # NEW: track original size
                         "fee_in": fill.fee,
+                        "total_partial_pnl": Decimal("0"),  # NEW: accumulate partial PnL
+                        "total_partial_fees": Decimal("0"),  # NEW: accumulate partial fees
                         "mode": "backtest",
                     }
                     pending_order_id = None
                     logger.debug("backtest_entry", price=str(fill.price), ts=fill.timestamp.isoformat())
 
-                elif close_order_id and fill.order_id == close_order_id:
-                    # Exit fill
+                elif partial_close_order_id and fill.order_id == partial_close_order_id:
+                    # ── PARTIAL CLOSE fill ─────────────────────────────
                     if open_trade:
                         exit_price = fill.price
                         entry_price = open_trade["entry_price"]
-                        qty = open_trade["qty"]
+                        closed_qty = fill.qty
+                        gross_pnl = (exit_price - entry_price) * closed_qty
+                        fee_out = fill.fee
+                        # Proportional entry fee for the closed portion
+                        pct_closed_of_original = closed_qty / open_trade["original_qty"]
+                        fee_in_portion = open_trade["fee_in"] * pct_closed_of_original
+                        net_pnl = gross_pnl - fee_in_portion - fee_out
+
+                        # Accumulate partial PnL
+                        open_trade["total_partial_pnl"] += net_pnl
+                        open_trade["total_partial_fees"] += fee_in_portion + fee_out
+
+                        # Reduce remaining qty
+                        open_trade["qty"] -= closed_qty
+                        if open_trade["qty"] < Decimal("0.0001"):
+                            # Fully closed via partials (edge case: close_pct summed to 100%)
+                            self._record_completed_trade(
+                                result, open_trade, exit_price, fill.timestamp,
+                                fee_out, is_final_partial=True,
+                            )
+                            open_trade = None
+                        else:
+                            logger.debug(
+                                "backtest_partial_close",
+                                closed_qty=str(closed_qty),
+                                remaining_qty=str(open_trade["qty"]),
+                                partial_pnl=str(net_pnl),
+                                ts=fill.timestamp.isoformat(),
+                            )
+
+                    partial_close_order_id = None
+                    partial_close_pct = 0.0
+
+                elif close_order_id and fill.order_id == close_order_id:
+                    # ── FULL CLOSE fill ────────────────────────────────
+                    if open_trade:
+                        exit_price = fill.price
+                        entry_price = open_trade["entry_price"]
+                        qty = fill.qty
                         gross_pnl = (exit_price - entry_price) * qty
-                        fees = open_trade["fee_in"] + fill.fee
-                        net_pnl = gross_pnl - fees
-                        pnl_pct = net_pnl / (entry_price * qty) * 100
+
+                        # Fee for the remaining portion
+                        remaining_pct = qty / open_trade["original_qty"]
+                        fee_in_portion = open_trade["fee_in"] * remaining_pct
+                        fee_out = fill.fee
+                        net_pnl_this_leg = gross_pnl - fee_in_portion - fee_out
+
+                        # Total PnL = partial legs + final leg
+                        total_net_pnl = open_trade["total_partial_pnl"] + net_pnl_this_leg
+                        total_fees = open_trade["total_partial_fees"] + fee_in_portion + fee_out
 
                         trade_record = {
-                            **open_trade,
+                            "trade_id": open_trade["trade_id"],
+                            "symbol": open_trade["symbol"],
+                            "side": open_trade["side"],
+                            "entry_ts": open_trade["entry_ts"],
+                            "entry_price": open_trade["entry_price"],
+                            "qty": open_trade["original_qty"],  # Report original full qty
+                            "fee_in": open_trade["fee_in"],
+                            "mode": open_trade["mode"],
                             "exit_ts": fill.timestamp,
                             "exit_price": exit_price,
-                            "pnl": net_pnl,
-                            "pnl_pct": pnl_pct,
-                            "fees": fees,
+                            "pnl": total_net_pnl,
+                            "pnl_pct": total_net_pnl / (entry_price * open_trade["original_qty"]) * 100,
+                            "fees": total_fees,
+                            "had_partial_close": open_trade["total_partial_pnl"] != Decimal("0"),
                         }
                         result.trades.append(
                             {k: str(v) if isinstance(v, Decimal) else v
                              for k, v in trade_record.items()}
                         )
                         result.total_trades += 1
-                        if net_pnl > 0:
+                        if total_net_pnl > 0:
                             result.winning_trades += 1
                         else:
                             result.losing_trades += 1
-                        result.total_pnl += net_pnl
-                        self._risk.record_fill(net_pnl)
+                        result.total_pnl += total_net_pnl
+                        self._risk.record_fill(total_net_pnl)
                         open_trade = None
+
                     close_order_id = None
 
             if open_trade:
@@ -243,6 +317,17 @@ class BacktestEngine:
                         "reason": signal.reason,
                     }
                 )
+
+            if self._verbose:
+                result.bar_data.append({
+                    "ts": bar.ts.isoformat(),
+                    "o": float(bar.open), "h": float(bar.high),
+                    "l": float(bar.low), "c": float(bar.close),
+                    "v": float(bar.volume),
+                    "signal": signal.action.value,
+                    "reason": signal.reason,
+                    "meta": signal.meta,
+                })
 
             # 4. Risk validation
             balances = await adapter.get_balance()
@@ -276,7 +361,32 @@ class BacktestEngine:
                 order, _ = await adapter.place_order(req)
                 pending_order_id = order.order_id
 
+            elif signal.action == SignalAction.PARTIAL_CLOSE and open_trade is not None and partial_close_order_id is None:
+                # ── NEW: PARTIAL CLOSE ─────────────────────────────────
+                close_pct = signal.close_pct
+                close_qty = (open_trade["qty"] * Decimal(str(close_pct))).quantize(Decimal("0.001"))
+                close_qty = min(close_qty, open_trade["qty"])  # Safety: never close more than we have
+
+                if close_qty > Decimal("0"):
+                    req = OrderRequest(
+                        symbol=symbol,
+                        side=OrderSide.SELL,
+                        order_type=OrderType.MARKET,
+                        qty=close_qty,
+                        strategy_id=self._strategy.strategy_id,
+                    )
+                    order, _ = await adapter.place_order(req)
+                    partial_close_order_id = order.order_id
+                    partial_close_pct = close_pct
+                    logger.debug(
+                        "backtest_partial_close_ordered",
+                        close_pct=close_pct,
+                        close_qty=str(close_qty),
+                        remaining_qty=str(open_trade["qty"] - close_qty),
+                    )
+
             elif signal.action in (SignalAction.SELL, SignalAction.CLOSE) and open_trade is not None:
+                # Full close of remaining position
                 qty = open_trade["qty"]
                 req = OrderRequest(
                     symbol=symbol,
@@ -288,81 +398,139 @@ class BacktestEngine:
                 order, _ = await adapter.place_order(req)
                 close_order_id = order.order_id
 
-            # 6. Record equity
+            # 6. Equity curve
+            balances = await adapter.get_balance()
+            equity = balances[0].total if balances else self._initial_balance
+            # Mark-to-market: add unrealized PnL from open position
+            if open_trade:
+                unrealized = (bar.close - open_trade["entry_price"]) * open_trade["qty"]
+                equity += unrealized
             result.equity_curve.append({"ts": bar.ts, "equity": equity})
 
-        # ── Close open position at end ─────────────────────────────────
-        if open_trade is not None:
+        # ── Close any open position at end ────────────────────────────
+        if open_trade:
             last_bar = bars[-1]
-            close_price = last_bar.close * (1 - self._slippage)
-            fee = close_price * open_trade["qty"] * self._commission
-            net_pnl = (close_price - open_trade["entry_price"]) * open_trade["qty"] - fee - open_trade["fee_in"]
+            exit_price = last_bar.close
+            entry_price = open_trade["entry_price"]
+            qty = open_trade["qty"]
+            gross_pnl = (exit_price - entry_price) * qty
+
+            remaining_pct = qty / open_trade["original_qty"]
+            fee_in_portion = open_trade["fee_in"] * remaining_pct
+            fee_out = exit_price * qty * self._commission
+            net_pnl_this_leg = gross_pnl - fee_in_portion - fee_out
+
+            total_net_pnl = open_trade["total_partial_pnl"] + net_pnl_this_leg
+            total_fees = open_trade["total_partial_fees"] + fee_in_portion + fee_out
+
+            trade_record = {
+                "trade_id": open_trade["trade_id"],
+                "symbol": open_trade["symbol"],
+                "side": open_trade["side"],
+                "entry_ts": open_trade["entry_ts"],
+                "entry_price": open_trade["entry_price"],
+                "qty": open_trade["original_qty"],
+                "fee_in": open_trade["fee_in"],
+                "mode": open_trade["mode"],
+                "exit_ts": last_bar.ts,
+                "exit_price": exit_price,
+                "pnl": total_net_pnl,
+                "pnl_pct": total_net_pnl / (entry_price * open_trade["original_qty"]) * 100,
+                "fees": total_fees,
+                "had_partial_close": open_trade["total_partial_pnl"] != Decimal("0"),
+                "forced_close": True,
+            }
             result.trades.append(
-                {
-                    **{k: str(v) if isinstance(v, Decimal) else v for k, v in open_trade.items()},
-                    "exit_ts": last_bar.ts.isoformat(),
-                    "exit_price": str(close_price),
-                    "pnl": str(net_pnl),
-                    "pnl_pct": str(net_pnl / (open_trade["entry_price"] * open_trade["qty"]) * 100),
-                    "fees": str(fee),
-                    "forced_close": True,
-                }
+                {k: str(v) if isinstance(v, Decimal) else v for k, v in trade_record.items()}
             )
             result.total_trades += 1
-            if net_pnl > 0:
+            if total_net_pnl > 0:
                 result.winning_trades += 1
             else:
                 result.losing_trades += 1
-            result.total_pnl += net_pnl
+            result.total_pnl += total_net_pnl
+            open_trade = None
 
-        # ── Compute metrics ────────────────────────────────────────────
+        # ── Compute summary metrics ───────────────────────────────────
         result.total_bars = total_bars
-        result.total_pnl_pct = (result.total_pnl / self._initial_balance * 100).quantize(
-            Decimal("0.01")
-        )
         if result.total_trades > 0:
-            result.winrate = Decimal(result.winning_trades) / Decimal(result.total_trades) * 100
-            result.avg_trade_pnl = result.total_pnl / Decimal(result.total_trades)
+            result.winrate = Decimal(str(
+                round(result.winning_trades / result.total_trades * 100, 1)
+            ))
+            result.avg_trade_pnl = result.total_pnl / result.total_trades
+        result.total_pnl_pct = Decimal(str(
+            round(float(result.total_pnl / self._initial_balance * 100), 2)
+        ))
+        result.exposure_pct = Decimal(str(
+            round(bars_in_position / max(total_bars, 1) * 100, 2)
+        ))
 
-        if total_bars > 0:
-            result.exposure_pct = Decimal(bars_in_position) / Decimal(total_bars) * 100
+        # Max drawdown
+        if result.equity_curve:
+            equities = [float(e["equity"]) for e in result.equity_curve]
+            peak = equities[0]
+            max_dd = 0.0
+            for eq in equities:
+                peak = max(peak, eq)
+                dd = (peak - eq) / peak * 100 if peak > 0 else 0
+                max_dd = max(max_dd, dd)
+            result.max_drawdown_pct = Decimal(str(round(max_dd, 2)))
 
-        result.max_drawdown_pct = self._compute_max_drawdown(result.equity_curve)
-        result.sharpe_ratio = self._compute_sharpe(result.equity_curve)
+        # Sharpe ratio (annualized, 5m bars)
+        if result.trades:
+            pnls = [float(t["pnl"]) if isinstance(t["pnl"], str) else float(t["pnl"])
+                    for t in result.trades]
+            if len(pnls) >= 2 and np.std(pnls) > 0:
+                sharpe = np.mean(pnls) / np.std(pnls) * np.sqrt(len(pnls))
+                result.sharpe_ratio = Decimal(str(round(sharpe, 3)))
 
         logger.info(
-            "backtest_done",
+            "backtest_complete",
             run_id=run_id,
-            trades=result.total_trades,
-            pnl_pct=str(result.total_pnl_pct),
+            total_trades=result.total_trades,
+            total_pnl=str(result.total_pnl),
             winrate=str(result.winrate),
             max_dd=str(result.max_drawdown_pct),
-            sharpe=str(result.sharpe_ratio),
         )
         return result
 
-    @staticmethod
-    def _compute_max_drawdown(equity_curve: list[dict]) -> Decimal:
-        if not equity_curve:
-            return Decimal("0")
-        equities = [float(e["equity"]) for e in equity_curve]
-        peak = equities[0]
-        max_dd = 0.0
-        for eq in equities:
-            if eq > peak:
-                peak = eq
-            dd = (peak - eq) / peak * 100 if peak > 0 else 0
-            max_dd = max(max_dd, dd)
-        return Decimal(str(round(max_dd, 2)))
+    def _record_completed_trade(
+        self,
+        result: BacktestResult,
+        open_trade: dict,
+        final_exit_price: Decimal,
+        exit_ts: datetime,
+        final_fee_out: Decimal,
+        is_final_partial: bool = False,
+    ) -> None:
+        """Record a trade that was fully closed via accumulated partial closes."""
+        entry_price = open_trade["entry_price"]
+        total_net_pnl = open_trade["total_partial_pnl"]
+        total_fees = open_trade["total_partial_fees"]
 
-    @staticmethod
-    def _compute_sharpe(equity_curve: list[dict], periods_per_year: int = 252) -> Decimal:
-        """Simplified Sharpe ratio (annualized, assuming 0% risk-free rate)."""
-        if len(equity_curve) < 2:
-            return Decimal("0")
-        equities = [float(e["equity"]) for e in equity_curve]
-        returns = np.diff(equities) / np.array(equities[:-1])
-        if returns.std() == 0:
-            return Decimal("0")
-        sharpe = (returns.mean() / returns.std()) * np.sqrt(periods_per_year)
-        return Decimal(str(round(sharpe, 3)))
+        trade_record = {
+            "trade_id": open_trade["trade_id"],
+            "symbol": open_trade["symbol"],
+            "side": open_trade["side"],
+            "entry_ts": open_trade["entry_ts"],
+            "entry_price": entry_price,
+            "qty": open_trade["original_qty"],
+            "fee_in": open_trade["fee_in"],
+            "mode": open_trade["mode"],
+            "exit_ts": exit_ts,
+            "exit_price": final_exit_price,
+            "pnl": total_net_pnl,
+            "pnl_pct": total_net_pnl / (entry_price * open_trade["original_qty"]) * 100,
+            "fees": total_fees,
+            "had_partial_close": True,
+        }
+        result.trades.append(
+            {k: str(v) if isinstance(v, Decimal) else v for k, v in trade_record.items()}
+        )
+        result.total_trades += 1
+        if total_net_pnl > 0:
+            result.winning_trades += 1
+        else:
+            result.losing_trades += 1
+        result.total_pnl += total_net_pnl
+        self._risk.record_fill(total_net_pnl)

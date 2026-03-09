@@ -1,11 +1,13 @@
 from app.strategy.ema_cross import EMACrossStrategy
 from app.strategy.rsi_divergence import RSIDivergenceStrategy
+from app.strategy.hybrid_rsi_pivot import HybridRSIPivotStrategy
 from app.strategy.base import BaseStrategy
 from app.strategy.signals import Signal, SignalAction
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "ema_cross": EMACrossStrategy,
     "rsi_divergence": RSIDivergenceStrategy,
+    "hybrid_rsi_pivot": HybridRSIPivotStrategy,
 }
 
 
@@ -18,6 +20,6 @@ def get_strategy(name: str, symbol: str, params: dict | None = None) -> BaseStra
 
 __all__ = [
     "BaseStrategy", "Signal", "SignalAction",
-    "EMACrossStrategy", "RSIDivergenceStrategy",
+    "EMACrossStrategy", "RSIDivergenceStrategy", "HybridRSIPivotStrategy",
     "get_strategy",
 ]

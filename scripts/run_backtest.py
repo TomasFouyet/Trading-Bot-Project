@@ -42,7 +42,7 @@ async def main(args: argparse.Namespace) -> None:
             "ema_slow": args.ema_slow,
             "sma_trend": args.sma_trend,
         }
-    elif args.strategy == "rsi_divergence":
+    elif args.strategy in ("rsi_divergence", "hybrid_rsi_pivot"):
         strategy_params = {
             "rsi_period": args.rsi_period,
             "ema_period": args.ema_period,
@@ -55,6 +55,15 @@ async def main(args: argparse.Namespace) -> None:
             "allow_short": args.allow_short,
             "sl_buffer_pct": args.sl_buffer_pct,
             "rr_ratio": args.rr_ratio,
+            # Hybrid-only params
+            "atr_period": args.atr_period,
+            "atr_sl_mult": args.atr_sl_mult,
+            "pivot_atr_proximity": args.pivot_atr_proximity,
+            "vol_avg_period": args.vol_avg_period,
+            "vol_min_ratio": args.vol_min_ratio,
+            "session_start_utc": args.session_start_utc,
+            "session_end_utc": args.session_end_utc,
+            "bars_per_day": args.bars_per_day,
         }
     else:
         strategy_params = {}
@@ -80,6 +89,7 @@ async def main(args: argparse.Namespace) -> None:
         initial_balance=Decimal(str(args.balance)),
         commission_rate=Decimal(str(args.commission_bps)) / 10000,
         slippage_rate=Decimal(str(args.slippage_bps)) / 10000,
+        verbose=bool(args.output),
     )
 
     result = await engine.run(args.symbol, args.timeframe, start, end, strategy_params)
@@ -100,9 +110,11 @@ async def main(args: argparse.Namespace) -> None:
     print("=" * 60)
 
     if args.output:
+        report["initial_balance"] = args.balance
         with open(args.output, "w") as f:
             json.dump(report, f, indent=2, default=str)
         print(f"\nFull report saved to: {args.output}")
+        print(f"Viewer: open scripts/backtest_viewer.html in your browser and load the JSON")
 
 
 if __name__ == "__main__":
@@ -113,7 +125,7 @@ if __name__ == "__main__":
     parser.add_argument("--end", default="2026-03-06")
     parser.add_argument("--balance", type=float, default=10000.0)
     parser.add_argument("--strategy", default="ema_cross",
-                        choices=["ema_cross", "rsi_divergence"],
+                        choices=["ema_cross", "rsi_divergence", "hybrid_rsi_pivot"],
                         help="Strategy to backtest")
     parser.add_argument("--commission-bps", type=float, default=7.5, dest="commission_bps")
     parser.add_argument("--slippage-bps", type=float, default=5.0, dest="slippage_bps")
@@ -136,6 +148,17 @@ if __name__ == "__main__":
     parser.add_argument("--allow-short", action="store_true", default=True, dest="allow_short")
     parser.add_argument("--sl-buffer-pct", type=float, default=0.003, dest="sl_buffer_pct")
     parser.add_argument("--rr-ratio", type=float, default=1.5, dest="rr_ratio")
+
+    # Hybrid RSI Pivot params
+    parser.add_argument("--atr-period", type=int, default=14, dest="atr_period")
+    parser.add_argument("--atr-sl-mult", type=float, default=1.5, dest="atr_sl_mult")
+    parser.add_argument("--pivot-atr-proximity", type=float, default=1.5, dest="pivot_atr_proximity")
+    parser.add_argument("--vol-avg-period", type=int, default=20, dest="vol_avg_period")
+    parser.add_argument("--vol-min-ratio", type=float, default=0.5, dest="vol_min_ratio")
+    parser.add_argument("--session-start-utc", type=int, default=8, dest="session_start_utc")
+    parser.add_argument("--session-end-utc", type=int, default=21, dest="session_end_utc")
+    parser.add_argument("--bars-per-day", type=int, default=288, dest="bars_per_day",
+                        help="Bars per calendar day: 288 for 5m, 96 for 15m, 24 for 1h")
 
     args = parser.parse_args()
     asyncio.run(main(args))

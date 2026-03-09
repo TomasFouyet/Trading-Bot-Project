@@ -120,38 +120,53 @@ class BacktestAdapter(BrokerAdapter):
 
     def _apply_fill_to_portfolio(self, fill: FillResult) -> None:
         notional = fill.price * fill.qty
+        pos = self._positions.get(fill.symbol)
 
         if fill.side == OrderSide.BUY:
-            cost = notional + fill.fee
-            if self._balance < cost:
-                logger.warning("backtest_insufficient_funds", required=str(cost), available=str(self._balance))
-            self._balance -= cost
-
-            pos = self._positions.get(fill.symbol)
-            if pos is None:
-                self._positions[fill.symbol] = Position(
-                    symbol=fill.symbol,
-                    side=TradeSide.LONG,
-                    qty=fill.qty,
-                    avg_price=fill.price,
-                    unrealized_pnl=Decimal("0"),
-                )
+            if pos and pos.side == TradeSide.SHORT:
+                # Closing a SHORT position: pay to buy back
+                close_qty = min(fill.qty, pos.qty)
+                pos.qty -= close_qty
+                if pos.qty <= Decimal("1e-10"):
+                    del self._positions[fill.symbol]
+                self._balance -= fill.price * close_qty + fill.fee
             else:
-                total_qty = pos.qty + fill.qty
-                pos.avg_price = (pos.avg_price * pos.qty + fill.price * fill.qty) / total_qty
-                pos.qty = total_qty
+                # Opening a LONG position
+                cost = notional + fill.fee
+                if self._balance < cost:
+                    logger.warning("backtest_insufficient_funds", required=str(cost), available=str(self._balance))
+                self._balance -= cost
+                if pos is None:
+                    self._positions[fill.symbol] = Position(
+                        symbol=fill.symbol,
+                        side=TradeSide.LONG,
+                        qty=fill.qty,
+                        avg_price=fill.price,
+                        unrealized_pnl=Decimal("0"),
+                    )
+                else:
+                    total_qty = pos.qty + fill.qty
+                    pos.avg_price = (pos.avg_price * pos.qty + fill.price * fill.qty) / total_qty
+                    pos.qty = total_qty
 
         else:  # SELL
-            pos = self._positions.get(fill.symbol)
-            if pos and pos.qty > 0:
+            if pos and pos.side == TradeSide.LONG and pos.qty > 0:
+                # Closing a LONG position
                 sell_qty = min(fill.qty, pos.qty)
-                pnl = (fill.price - pos.avg_price) * sell_qty
                 pos.qty -= sell_qty
                 if pos.qty <= Decimal("1e-10"):
                     del self._positions[fill.symbol]
                 self._balance += sell_qty * fill.price - fill.fee
             else:
+                # Opening a SHORT position: receive proceeds
                 self._balance += notional - fill.fee
+                self._positions[fill.symbol] = Position(
+                    symbol=fill.symbol,
+                    side=TradeSide.SHORT,
+                    qty=fill.qty,
+                    avg_price=fill.price,
+                    unrealized_pnl=Decimal("0"),
+                )
 
     def _mark_to_market(self) -> Decimal:
         """Total equity = cash + mark-to-market of open positions."""
@@ -159,7 +174,10 @@ class BacktestAdapter(BrokerAdapter):
         if self._current_bar:
             for pos in self._positions.values():
                 if pos.symbol == self._current_bar.symbol:
-                    equity += pos.qty * self._current_bar.close
+                    if pos.side == TradeSide.LONG:
+                        equity += pos.qty * self._current_bar.close
+                    else:  # SHORT: subtract current liability
+                        equity -= pos.qty * self._current_bar.close
         return equity
 
     # ── BrokerAdapter interface ────────────────────────────────────────────

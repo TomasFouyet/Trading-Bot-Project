@@ -1,0 +1,70 @@
+{
+  "run_id": "4a7182fb-14a4-4357-944a-ca8c0c8d20da",
+  "symbol": "BTC-USDT",
+  "timeframe": "5m",
+  "strategy_id": "hybrid_rsi_pivot_rsi9_ema14_atr14x1.5_rr1.5_shortTrue",
+  "start_date": "2025-11-20T00:00:00+00:00",
+  "end_date": "2026-03-06T00:00:00+00:00",
+  "params": {
+    "rsi_period": 9,
+    "ema_period": 14,
+    "swing_window": 5,
+    "swing_separation": 10,
+    "swing_lookback": 100,
+    "trigger_window": 10,
+    "rsi_oversold": 30.0,
+    "rsi_overbought": 70.0,
+    "allow_short": true,
+    "sl_buffer_pct": 0.003,
+    "rr_ratio": 1.5,
+    "atr_period": 14,
+    "atr_sl_mult": 1.5,
+    "pivot_atr_proximity": 1.5,
+    "vol_avg_period": 20,
+    "vol_min_ratio": 0.5,
+    "session_start_utc": 8,
+    "session_end_utc": 21,
+    "bars_per_day": 288
+  },
+  "metrics": {
+    "total_bars": 30097,
+    "total_trades": 1,
+    "winning_trades": 0,
+    "losing_trades": 1,
+    "winrate": 0.0,
+    "total_pnl": -105.60407565405,
+    "total_pnl_pct": -1.06,
+    "max_drawdown_pct": 5.3,
+    "sharpe_ratio": 0.0,
+    "avg_trade_pnl": -105.60407565405,
+    "exposure_pct": 35.79426520915706
+  },
+  "trades": [
+    {
+      "trade_id": "3be98d54-e618-4b6b-8424-31f0e86b6734",
+      "symbol": "BTC-USDT",
+      "side": "LONG",
+      "entry_ts": "2026-01-27 11:15:00-03:00",
+      "entry_price": "88294.12500",
+      "qty": "0.006",
+      "fee_in": "0.3973235625000",
+      "mode": "backtest",
+      "exit_ts": "2026-03-05T20:55:00-03:00",
+      "exit_price": "70812.77590",
+      "pnl": "-105.6040756540500",
+      "pnl_pct": "-19.93414542097223343002719603",
+      "fees": "0.3186574915500",
+      "forced_close": true
+    }
+  ],
+  "equity_curve": [
+    {
+      "ts": "2026-01-27T11:10:00-03:00",
+      "equity": 10000.0
+    },
+    {
+      "ts": "2026-01-27T11:15:00-03:00",
+      "equity": 9469.8379264375
+    }
+  ]
+}

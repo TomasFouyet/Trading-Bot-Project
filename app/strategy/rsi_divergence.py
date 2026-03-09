@@ -62,18 +62,25 @@ class RSIDivergenceStrategy(BaseStrategy):
 
         # Swing detection parameters
         self._swing_window = int(self.params.get("swing_window", 5))
-        self._swing_separation = int(self.params.get("swing_separation", 10))
+        self._swing_separation = int(self.params.get("swing_separation", 5))
         self._swing_lookback = int(self.params.get("swing_lookback", 100))
         self._trigger_window = int(self.params.get("trigger_window", 10))
 
         # Signal thresholds
-        self._rsi_oversold = float(self.params.get("rsi_oversold", 30.0))
-        self._rsi_overbought = float(self.params.get("rsi_overbought", 70.0))
+        self._rsi_oversold = float(self.params.get("rsi_oversold", 20.0))
+        self._rsi_overbought = float(self.params.get("rsi_overbought", 80.0))
         self._allow_short = bool(self.params.get("allow_short", True))
         self._sl_buffer_pct = float(self.params.get("sl_buffer_pct", 0.003))
         self._rr_ratio = float(self.params.get("rr_ratio", 1.5))
+        self._tp2_ratio = float(self.params.get("tp2_ratio", 1.75))
 
-        # State machine: "FLAT" | "ARMED" | "LONG" | "SHORT"
+        # State machine:
+        #   FLAT → ARMED → ENTRY_PENDING → LONG    → LONG_BE  → FLAT
+        #                               → SHORT   → SHORT_BE → FLAT
+        #
+        #   ARMED:         divergence detected, waiting for EMA confirmation candle
+        #   ENTRY_PENDING: confirmation candle closed; next bar fills at EMA level (limit sim)
+        #   LONG_BE / SHORT_BE: 75% closed, remaining 25% with SL at break even
         self._state: str = "FLAT"
 
         # Armed state data
@@ -82,10 +89,18 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._divergence_swing_price: Optional[float] = None
         self._divergence_swing_rsi: Optional[float] = None
 
-        # Open position tracking (for internal SL/TP monitoring)
+        # ENTRY_PENDING state: limit order at EMA crossing price
+        self._pending_entry_price: Optional[float] = None       # EMA level of confirmation bar
+        self._pending_direction: Optional[str] = None            # "LONG" or "SHORT"
+        self._pending_conf_extreme: Optional[float] = None       # low of conf bar (LONG) or high (SHORT) → SL reference
+        self._entry_pending_bars: int = 0
+        self._entry_window: int = int(self.params.get("entry_window", 2))  # bars to wait
+
+        # Open position tracking
         self._entry_price: Optional[float] = None
         self._sl_price: Optional[float] = None
-        self._tp_price: Optional[float] = None
+        self._tp1_price: Optional[float] = None   # TP1: close 70% at 1:rr_ratio
+        self._tp2_price: Optional[float] = None   # TP2: close remaining 30% at 1:tp2_ratio
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -233,17 +248,27 @@ class RSIDivergenceStrategy(BaseStrategy):
 
     # ── SL/TP computation ─────────────────────────────────────────────────────
 
-    def _compute_long_sl_tp(self, entry: float) -> tuple[float, float]:
+    def _compute_long_sl_tps(self, entry: float) -> tuple[float, float, float]:
+        """LONG: SL below vela2's low (divergence swing), TP1 at 1:rr_ratio (70%), TP2 at 1:tp2_ratio (30%)."""
         sl = self._divergence_swing_price * (1.0 - self._sl_buffer_pct)
         risk = entry - sl
-        tp = entry + risk * self._rr_ratio
-        return sl, tp
+        if risk <= 0:
+            risk = entry * self._sl_buffer_pct
+            sl = entry - risk
+        tp1 = entry + risk * self._rr_ratio
+        tp2 = entry + risk * self._tp2_ratio
+        return sl, tp1, tp2
 
-    def _compute_short_sl_tp(self, entry: float) -> tuple[float, float]:
+    def _compute_short_sl_tps(self, entry: float) -> tuple[float, float, float]:
+        """SHORT: SL above vela2's high (divergence swing), TP1 at 1:rr_ratio (70%), TP2 at 1:tp2_ratio (30%)."""
         sl = self._divergence_swing_price * (1.0 + self._sl_buffer_pct)
         risk = sl - entry
-        tp = entry - risk * self._rr_ratio
-        return sl, tp
+        if risk <= 0:
+            risk = entry * self._sl_buffer_pct
+            sl = entry + risk
+        tp1 = entry - risk * self._rr_ratio
+        tp2 = entry - risk * self._tp2_ratio
+        return sl, tp1, tp2
 
     # ── State resets ──────────────────────────────────────────────────────────
 
@@ -253,9 +278,14 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._armed_direction = None
         self._divergence_swing_price = None
         self._divergence_swing_rsi = None
+        self._pending_entry_price = None
+        self._pending_direction = None
+        self._pending_conf_extreme = None
+        self._entry_pending_bars = 0
         self._entry_price = None
         self._sl_price = None
-        self._tp_price = None
+        self._tp1_price = None
+        self._tp2_price = None
 
     # ── Main signal logic ─────────────────────────────────────────────────────
 
@@ -299,34 +329,143 @@ class RSIDivergenceStrategy(BaseStrategy):
             "rsi": round(cur_rsi, 2),
             "ema": round(cur_ema, 4),
             "sl": self._sl_price,
-            "tp": self._tp_price,
+            "tp": self._tp1_price if self._tp1_price is not None else self._tp2_price,
         }
 
-        # ── LONG: monitor SL/TP ───────────────────────────────────────
+        # ── LONG: monitor TP1 (70%) and SL ───────────────────────────
         if self._state == "LONG":
-            if cur_high >= self._tp_price:
-                tp = self._tp_price
-                self._reset_to_flat()
-                return close(f"long_tp_hit tp={tp:.4f}", base_meta)
+            # Worst-case: if both SL and TP1 hit same bar → assume SL
             if cur_low <= self._sl_price:
                 sl = self._sl_price
                 self._reset_to_flat()
                 return close(f"long_sl_hit sl={sl:.4f}", base_meta)
+            if cur_high >= self._tp1_price:
+                tp1 = self._tp1_price
+                be = self._entry_price
+                tp2 = self._tp2_price
+                self._sl_price = be          # move SL to break even
+                self._tp1_price = None       # TP1 consumed
+                self._state = "LONG_BE"
+                return Signal(
+                    action=SignalAction.PARTIAL_CLOSE,
+                    symbol=self.symbol, ts=ts,
+                    strategy_id=self.strategy_id,
+                    reason=f"long_tp1_hit tp1={tp1:.4f} sl_be={be:.4f} tp2={tp2:.4f}",
+                    meta={**base_meta, "close_pct": 0.70, "be": be, "tp2": tp2},
+                )
             return hold("long_open", base_meta)
 
-        # ── SHORT: monitor SL/TP ──────────────────────────────────────
-        if self._state == "SHORT":
-            if cur_low <= self._tp_price:
-                tp = self._tp_price
+        # ── LONG_BE: remaining 30% — TP2 at 1.75 R:R or BE stop ─────
+        if self._state == "LONG_BE":
+            if cur_low <= self._sl_price:    # BE stop hit
+                sl = self._sl_price
                 self._reset_to_flat()
-                return close(f"short_tp_hit tp={tp:.4f}", base_meta)
+                return close(f"long_be_sl_hit sl={sl:.4f}", base_meta)
+            if cur_high >= self._tp2_price:  # TP2 hit — close remaining 30%
+                tp2 = self._tp2_price
+                self._reset_to_flat()
+                return close(f"long_tp2_hit tp2={tp2:.4f}", base_meta)
+            return hold("long_be_open", base_meta)
+
+        # ── SHORT: monitor TP1 (70%) and SL ──────────────────────────
+        if self._state == "SHORT":
             if cur_high >= self._sl_price:
                 sl = self._sl_price
                 self._reset_to_flat()
                 return close(f"short_sl_hit sl={sl:.4f}", base_meta)
+            if cur_low <= self._tp1_price:
+                tp1 = self._tp1_price
+                be = self._entry_price
+                tp2 = self._tp2_price
+                self._sl_price = be
+                self._tp1_price = None       # TP1 consumed
+                self._state = "SHORT_BE"
+                return Signal(
+                    action=SignalAction.PARTIAL_CLOSE,
+                    symbol=self.symbol, ts=ts,
+                    strategy_id=self.strategy_id,
+                    reason=f"short_tp1_hit tp1={tp1:.4f} sl_be={be:.4f} tp2={tp2:.4f}",
+                    meta={**base_meta, "close_pct": 0.70, "be": be, "tp2": tp2},
+                )
             return hold("short_open", base_meta)
 
-        # ── ARMED: wait for EMA trigger ───────────────────────────────
+        # ── SHORT_BE: remaining 30% — TP2 at 1.75 R:R or BE stop ────
+        if self._state == "SHORT_BE":
+            if cur_high >= self._sl_price:   # BE stop hit
+                sl = self._sl_price
+                self._reset_to_flat()
+                return close(f"short_be_sl_hit sl={sl:.4f}", base_meta)
+            if cur_low <= self._tp2_price:   # TP2 hit — close remaining 30%
+                tp2 = self._tp2_price
+                self._reset_to_flat()
+                return close(f"short_tp2_hit tp2={tp2:.4f}", base_meta)
+            return hold("short_be_open", base_meta)
+
+        # ── ENTRY_PENDING: confirmation fired; wait for limit fill at EMA ──
+        if self._state == "ENTRY_PENDING":
+            self._entry_pending_bars += 1
+            entry_price = self._pending_entry_price
+
+            if self._pending_direction == "LONG":
+                # Fill condition: this bar's low touched (or pierced) the EMA entry level
+                if cur_low <= entry_price:
+                    sl, tp1, tp2 = self._compute_long_sl_tps(entry_price)
+                    self._entry_price = entry_price
+                    self._sl_price = sl
+                    self._tp1_price = tp1
+                    self._tp2_price = tp2
+                    self._state = "LONG"
+                    return Signal(
+                        action=SignalAction.BUY,
+                        symbol=self.symbol, ts=ts,
+                        strategy_id=self.strategy_id,
+                        confidence=1.0,
+                        stop_loss=Decimal(str(round(sl, 8))),
+                        take_profit=Decimal(str(round(tp1, 8))),
+                        reason=(
+                            f"bullish_div_long_entry_limit "
+                            f"entry={entry_price:.4f} sl={sl:.4f} tp1={tp1:.4f} tp2={tp2:.4f}"
+                        ),
+                        meta={**base_meta, "swing_low": self._divergence_swing_price,
+                              "limit_entry": entry_price, "tp2": tp2},
+                    )
+
+            elif self._pending_direction == "SHORT" and self._allow_short:
+                # Fill condition: this bar's high touched (or pierced) the EMA entry level
+                if cur_high >= entry_price:
+                    sl, tp1, tp2 = self._compute_short_sl_tps(entry_price)
+                    self._entry_price = entry_price
+                    self._sl_price = sl
+                    self._tp1_price = tp1
+                    self._tp2_price = tp2
+                    self._state = "SHORT"
+                    return Signal(
+                        action=SignalAction.SELL,
+                        symbol=self.symbol, ts=ts,
+                        strategy_id=self.strategy_id,
+                        confidence=1.0,
+                        stop_loss=Decimal(str(round(sl, 8))),
+                        take_profit=Decimal(str(round(tp1, 8))),
+                        reason=(
+                            f"bearish_div_short_entry_limit "
+                            f"entry={entry_price:.4f} sl={sl:.4f} tp1={tp1:.4f} tp2={tp2:.4f}"
+                        ),
+                        meta={**base_meta, "swing_high": self._divergence_swing_price,
+                              "limit_entry": entry_price, "tp2": tp2},
+                    )
+
+            # Limit not filled within entry_window → cancel
+            if self._entry_pending_bars >= self._entry_window:
+                self._reset_to_flat()
+                return hold("entry_pending_expired", base_meta)
+
+            return hold(
+                f"entry_pending_{self._pending_direction} "
+                f"limit={entry_price:.4f} bar {self._entry_pending_bars}/{self._entry_window}",
+                base_meta,
+            )
+
+        # ── ARMED: wait for EMA confirmation candle ───────────────────
         if self._state == "ARMED":
             self._armed_bars_elapsed += 1
 
@@ -335,51 +474,32 @@ class RSIDivergenceStrategy(BaseStrategy):
                 self._state = "FLAT"
                 self._armed_direction = None
                 self._armed_bars_elapsed = 0
-                # (divergence_swing_price kept until new one is found)
 
             else:
                 if self._armed_direction == "LONG" and self._long_trigger(df):
-                    sl, tp = self._compute_long_sl_tp(cur_close)
-                    self._entry_price = cur_close
-                    self._sl_price = sl
-                    self._tp_price = tp
-                    self._state = "LONG"
-                    return Signal(
-                        action=SignalAction.BUY,
-                        symbol=self.symbol,
-                        ts=ts,
-                        strategy_id=self.strategy_id,
-                        confidence=1.0,
-                        stop_loss=Decimal(str(round(sl, 8))),
-                        take_profit=Decimal(str(round(tp, 8))),
-                        reason=(
-                            f"bullish_div_long_entry "
-                            f"close={cur_close:.4f} ema={cur_ema:.4f} "
-                            f"sl={sl:.4f} tp={tp:.4f}"
-                        ),
-                        meta={**base_meta, "swing_low": self._divergence_swing_price},
+                    # Confirmation: candle closed above EMA.
+                    # Entry limit = EMA level; SL reference = this candle's LOW.
+                    self._pending_entry_price = cur_ema
+                    self._pending_direction = "LONG"
+                    self._pending_conf_extreme = cur_low   # SL goes below this low
+                    self._entry_pending_bars = 0
+                    self._state = "ENTRY_PENDING"
+                    return hold(
+                        f"long_confirmed ema={cur_ema:.4f} conf_low={cur_low:.4f} waiting_limit_fill",
+                        base_meta,
                     )
 
                 if self._armed_direction == "SHORT" and self._allow_short and self._short_trigger(df):
-                    sl, tp = self._compute_short_sl_tp(cur_close)
-                    self._entry_price = cur_close
-                    self._sl_price = sl
-                    self._tp_price = tp
-                    self._state = "SHORT"
-                    return Signal(
-                        action=SignalAction.SELL,
-                        symbol=self.symbol,
-                        ts=ts,
-                        strategy_id=self.strategy_id,
-                        confidence=1.0,
-                        stop_loss=Decimal(str(round(sl, 8))),
-                        take_profit=Decimal(str(round(tp, 8))),
-                        reason=(
-                            f"bearish_div_short_entry "
-                            f"close={cur_close:.4f} ema={cur_ema:.4f} "
-                            f"sl={sl:.4f} tp={tp:.4f}"
-                        ),
-                        meta={**base_meta, "swing_high": self._divergence_swing_price},
+                    # Confirmation: candle closed below EMA.
+                    # Entry limit = EMA level; SL reference = this candle's HIGH.
+                    self._pending_entry_price = cur_ema
+                    self._pending_direction = "SHORT"
+                    self._pending_conf_extreme = cur_high  # SL goes above this high
+                    self._entry_pending_bars = 0
+                    self._state = "ENTRY_PENDING"
+                    return hold(
+                        f"short_confirmed ema={cur_ema:.4f} conf_high={cur_high:.4f} waiting_limit_fill",
+                        base_meta,
                     )
 
                 return hold(
