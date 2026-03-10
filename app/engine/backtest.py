@@ -140,6 +140,7 @@ class BacktestEngine:
         start: datetime,
         end: datetime,
         params: dict | None = None,
+        htf_timeframe: str = "1h",
     ) -> BacktestResult:
         run_id = str(uuid.uuid4())
         logger.info(
@@ -147,16 +148,55 @@ class BacktestEngine:
             run_id=run_id,
             symbol=symbol,
             timeframe=timeframe,
+            htf_timeframe=htf_timeframe,
             start=start.isoformat(),
             end=end.isoformat(),
         )
 
-        # Load bars
+        # Load micro-timeframe bars
         bars = self._store.read_bars(symbol, timeframe, start, end)
         if len(bars) < self._strategy.min_bars_required + 10:
             raise ValueError(
                 f"Not enough bars: {len(bars)} < {self._strategy.min_bars_required + 10}"
             )
+
+        # Load higher-timeframe bars for trend filter (if strategy supports it)
+        _strategy_has_htf = hasattr(self._strategy, "set_htf_bars")
+        _htf_df: pd.DataFrame | None = None
+        if _strategy_has_htf:
+            # Load extra bars before `start` for indicator warm-up (EMA200 needs ~200 HTF bars)
+            from datetime import timedelta
+            _htf_warmup_days = 250  # enough for EMA200 on any HTF
+            htf_bars_raw = self._store.read_bars(
+                symbol,
+                htf_timeframe,
+                start - timedelta(days=_htf_warmup_days),
+                end,
+            )
+            if htf_bars_raw:
+                _htf_df = pd.DataFrame(
+                    {
+                        "ts":     pd.to_datetime([b.ts for b in htf_bars_raw], utc=True),
+                        "open":   [float(b.open)   for b in htf_bars_raw],
+                        "high":   [float(b.high)   for b in htf_bars_raw],
+                        "low":    [float(b.low)    for b in htf_bars_raw],
+                        "close":  [float(b.close)  for b in htf_bars_raw],
+                        "volume": [float(b.volume) for b in htf_bars_raw],
+                    }
+                ).sort_values("ts").reset_index(drop=True)
+                logger.info(
+                    "htf_bars_loaded",
+                    symbol=symbol,
+                    htf_timeframe=htf_timeframe,
+                    bars=len(_htf_df),
+                )
+            else:
+                logger.warning(
+                    "htf_bars_not_found",
+                    symbol=symbol,
+                    htf_timeframe=htf_timeframe,
+                    message="Trend filter disabled — no HTF data available",
+                )
 
         adapter = BacktestAdapter(
             bars=bars,
@@ -306,6 +346,13 @@ class BacktestEngine:
                 continue
 
             df = BaseStrategy.bars_to_df(window)
+
+            # 2b. Feed HTF bars to trend filter (no lookahead: only bars closed before current bar)
+            if _strategy_has_htf and _htf_df is not None:
+                cur_ts = pd.Timestamp(bar.ts).tz_convert("UTC") if bar.ts.tzinfo else pd.Timestamp(bar.ts, tz="UTC")
+                htf_window = _htf_df[_htf_df["ts"] < cur_ts].tail(300)
+                if len(htf_window) > 0:
+                    self._strategy.set_htf_bars(htf_window)
 
             # 3. Get signal
             signal = self._strategy.on_bar(df)

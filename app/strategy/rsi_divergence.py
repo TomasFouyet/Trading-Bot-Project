@@ -1,5 +1,5 @@
 """
-RSI Divergence Strategy with EMA14 trigger.
+RSI Divergence Strategy with EMA14 trigger and multi-timeframe trend filter.
 
 Detects classical RSI divergence (price vs. momentum) on any timeframe (designed for 5m).
 
@@ -13,8 +13,16 @@ Bearish (SHORT):
   - RSI at swing high 2 must be >= rsi_overbought
   - Entry when a subsequent candle closes below EMA14
 
-Exit: 100% close at 1:rr_ratio take-profit OR stop-loss.
-  (The engine does not support partial closes; SL/TP are self-enforced inside on_bar.)
+Macro trend filter (TrendContext):
+  - Analyzes HTF bars (default 1H) via EMA50, EMA200, and ADX-14
+  - Assigns a coefficient [0.0, 1.0] per trade direction based on macro alignment
+  - Trades with coefficient < min_trend_coeff are blocked
+  - Feed HTF bars via set_htf_bars(df) before each on_bar() call
+
+Exit (two-leg):
+  - TP1 at 1:rr_ratio  → closes 70% of position, SL moves to break-even
+  - TP2 at 1:tp2_ratio → closes remaining 30%
+  - BE stop: if price reverses after TP1, closes at entry price (no loss)
 
 Parameters:
     rsi_period       int,   default 9      — RSI period (Wilder's EMA)
@@ -27,7 +35,12 @@ Parameters:
     rsi_overbought   float, default 70     — RSI threshold for bearish divergence
     allow_short      bool,  default True   — enable SHORT signals
     sl_buffer_pct    float, default 0.003  — SL placed 0.3% beyond swing extreme
-    rr_ratio         float, default 1.5    — risk:reward multiplier for TP
+    rr_ratio         float, default 1.7    — TP1 risk:reward ratio (closes 70%)
+    tp2_ratio        float, default 2.0    — TP2 risk:reward ratio (closes remaining 30%)
+    min_trend_coeff  float, default 0.5    — minimum HTF coefficient to allow a trade
+    htf_ema_fast     int,   default 50     — HTF EMA fast period (trend direction)
+    htf_ema_slow     int,   default 200    — HTF EMA slow period (trend direction)
+    htf_adx_period   int,   default 14     — HTF ADX period (trend strength)
 """
 from __future__ import annotations
 
@@ -39,6 +52,7 @@ import pandas as pd
 
 from app.strategy.base import BaseStrategy
 from app.strategy.signals import Signal, SignalAction
+from app.strategy.trend_context import TrendContext
 
 
 class RSIDivergenceStrategy(BaseStrategy):
@@ -63,8 +77,8 @@ class RSIDivergenceStrategy(BaseStrategy):
         # Swing detection parameters
         self._swing_window = int(self.params.get("swing_window", 5))
         self._swing_separation = int(self.params.get("swing_separation", 5))
-        self._swing_lookback = int(self.params.get("swing_lookback", 100))
-        self._trigger_window = int(self.params.get("trigger_window", 10))
+        self._swing_lookback = int(self.params.get("swing_lookback", 20))
+        self._trigger_window = int(self.params.get("trigger_window", 5))
 
         # Signal thresholds
         self._rsi_oversold = float(self.params.get("rsi_oversold", 30.0))
@@ -73,6 +87,14 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._sl_buffer_pct = float(self.params.get("sl_buffer_pct", 0.003))
         self._rr_ratio = float(self.params.get("rr_ratio", 1.5))
         self._tp2_ratio = float(self.params.get("tp2_ratio", 1.75))
+        self._min_trend_coeff = float(self.params.get("min_trend_coeff", 0.5))
+
+        # Macro trend filter (HTF)
+        self._trend_ctx = TrendContext(
+            ema_fast=int(self.params.get("htf_ema_fast", 50)),
+            ema_slow=int(self.params.get("htf_ema_slow", 200)),
+            adx_period=int(self.params.get("htf_adx_period", 14)),
+        )
 
         # State machine:
         #   FLAT → ARMED → ENTRY_PENDING → LONG    → LONG_BE  → FLAT
@@ -88,6 +110,13 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._armed_direction: Optional[str] = None  # "LONG" or "SHORT"
         self._divergence_swing_price: Optional[float] = None
         self._divergence_swing_rsi: Optional[float] = None
+        # Swing debug info (timestamps and values of both swings at detection time)
+        self._div_sw1_ts: Optional[str] = None
+        self._div_sw2_ts: Optional[str] = None
+        self._div_sw1_price: Optional[float] = None
+        self._div_sw2_price: Optional[float] = None
+        self._div_sw1_rsi: Optional[float] = None
+        self._div_sw2_rsi: Optional[float] = None
 
         # ENTRY_PENDING state: limit order at EMA crossing price
         self._pending_entry_price: Optional[float] = None       # EMA level of confirmation bar
@@ -101,6 +130,16 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._sl_price: Optional[float] = None
         self._tp1_price: Optional[float] = None   # TP1: close 70% at 1:rr_ratio
         self._tp2_price: Optional[float] = None   # TP2: close remaining 30% at 1:tp2_ratio
+
+    # ── HTF trend filter ──────────────────────────────────────────────────────
+
+    def set_htf_bars(self, bars: pd.DataFrame) -> None:
+        """
+        Feed higher-timeframe bars to the macro trend filter.
+        Call this before on_bar() with a rolling window of HTF OHLCV bars.
+        bars must have columns: open, high, low, close, volume.
+        """
+        self._trend_ctx.update(bars)
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -205,6 +244,13 @@ class RSIDivergenceStrategy(BaseStrategy):
         if price2 < price1 and rsi2 > rsi1 and rsi1 <= self._rsi_oversold and rsi2 <= self._rsi_oversold:
             self._divergence_swing_price = float(price2)
             self._divergence_swing_rsi = float(rsi2)
+            # Store debug info for both swings
+            self._div_sw1_ts = str(df["ts"].iloc[idx1]) if "ts" in df.columns else None
+            self._div_sw2_ts = str(df["ts"].iloc[idx2]) if "ts" in df.columns else None
+            self._div_sw1_price = float(price1)
+            self._div_sw2_price = float(price2)
+            self._div_sw1_rsi = float(rsi1)
+            self._div_sw2_rsi = float(rsi2)
             return True
         return False
 
@@ -231,6 +277,13 @@ class RSIDivergenceStrategy(BaseStrategy):
         if price2 > price1 and rsi2 < rsi1 and rsi1 >= self._rsi_overbought and rsi2 >= self._rsi_overbought:
             self._divergence_swing_price = float(price2)
             self._divergence_swing_rsi = float(rsi2)
+            # Store debug info for both swings
+            self._div_sw1_ts = str(df["ts"].iloc[idx1]) if "ts" in df.columns else None
+            self._div_sw2_ts = str(df["ts"].iloc[idx2]) if "ts" in df.columns else None
+            self._div_sw1_price = float(price1)
+            self._div_sw2_price = float(price2)
+            self._div_sw1_rsi = float(rsi1)
+            self._div_sw2_rsi = float(rsi2)
             return True
         return False
 
@@ -249,8 +302,8 @@ class RSIDivergenceStrategy(BaseStrategy):
     # ── SL/TP computation ─────────────────────────────────────────────────────
 
     def _compute_long_sl_tps(self, entry: float) -> tuple[float, float, float]:
-        """LONG: SL below vela2's low (divergence swing), TP1 at 1:rr_ratio (70%), TP2 at 1:tp2_ratio (30%)."""
-        sl = self._divergence_swing_price * (1.0 - self._sl_buffer_pct)
+        """LONG: SL below confirmation candle's low (sl_buffer_pct below), TP1 at 1:rr_ratio (70%), TP2 at 1:tp2_ratio (30%)."""
+        sl = self._pending_conf_extreme * (1.0 - self._sl_buffer_pct)
         risk = entry - sl
         if risk <= 0:
             risk = entry * self._sl_buffer_pct
@@ -260,8 +313,8 @@ class RSIDivergenceStrategy(BaseStrategy):
         return sl, tp1, tp2
 
     def _compute_short_sl_tps(self, entry: float) -> tuple[float, float, float]:
-        """SHORT: SL above vela2's high (divergence swing), TP1 at 1:rr_ratio (70%), TP2 at 1:tp2_ratio (30%)."""
-        sl = self._divergence_swing_price * (1.0 + self._sl_buffer_pct)
+        """SHORT: SL above confirmation candle's high (sl_buffer_pct above), TP1 at 1:rr_ratio (70%), TP2 at 1:tp2_ratio (30%)."""
+        sl = self._pending_conf_extreme * (1.0 + self._sl_buffer_pct)
         risk = sl - entry
         if risk <= 0:
             risk = entry * self._sl_buffer_pct
@@ -278,6 +331,12 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._armed_direction = None
         self._divergence_swing_price = None
         self._divergence_swing_rsi = None
+        self._div_sw1_ts = None
+        self._div_sw2_ts = None
+        self._div_sw1_price = None
+        self._div_sw2_price = None
+        self._div_sw1_rsi = None
+        self._div_sw2_rsi = None
         self._pending_entry_price = None
         self._pending_direction = None
         self._pending_conf_extreme = None
@@ -426,7 +485,8 @@ class RSIDivergenceStrategy(BaseStrategy):
                             f"bullish_div_long_entry_limit "
                             f"entry={entry_price:.4f} sl={sl:.4f} tp1={tp1:.4f} tp2={tp2:.4f}"
                         ),
-                        meta={**base_meta, "swing_low": self._divergence_swing_price,
+                        meta={**base_meta, **self._trend_ctx.to_meta(),
+                              "swing_low": self._divergence_swing_price,
                               "limit_entry": entry_price, "tp2": tp2},
                     )
 
@@ -450,7 +510,8 @@ class RSIDivergenceStrategy(BaseStrategy):
                             f"bearish_div_short_entry_limit "
                             f"entry={entry_price:.4f} sl={sl:.4f} tp1={tp1:.4f} tp2={tp2:.4f}"
                         ),
-                        meta={**base_meta, "swing_high": self._divergence_swing_price,
+                        meta={**base_meta, **self._trend_ctx.to_meta(),
+                              "swing_high": self._divergence_swing_price,
                               "limit_entry": entry_price, "tp2": tp2},
                     )
 
@@ -477,6 +538,16 @@ class RSIDivergenceStrategy(BaseStrategy):
 
             else:
                 if self._armed_direction == "LONG" and self._long_trigger(df):
+                    # ── Macro trend filter ────────────────────────────────
+                    trend_coeff = self._trend_ctx.get_coefficient("LONG")
+                    trend_meta = self._trend_ctx.to_meta()
+                    if trend_coeff < self._min_trend_coeff:
+                        self._reset_to_flat()
+                        return hold(
+                            f"long_blocked_by_htf coeff={trend_coeff:.2f}<{self._min_trend_coeff} "
+                            f"htf={trend_meta['htf_direction']} adx={trend_meta['htf_adx_zone']}",
+                            {**base_meta, **trend_meta},
+                        )
                     # Confirmation: candle closed above EMA.
                     # Entry limit = EMA level; SL reference = this candle's LOW.
                     self._pending_entry_price = cur_ema
@@ -485,11 +556,22 @@ class RSIDivergenceStrategy(BaseStrategy):
                     self._entry_pending_bars = 0
                     self._state = "ENTRY_PENDING"
                     return hold(
-                        f"long_confirmed ema={cur_ema:.4f} conf_low={cur_low:.4f} waiting_limit_fill",
-                        base_meta,
+                        f"long_confirmed ema={cur_ema:.4f} conf_low={cur_low:.4f} "
+                        f"htf_coeff={trend_coeff:.2f} waiting_limit_fill",
+                        {**base_meta, **trend_meta},
                     )
 
                 if self._armed_direction == "SHORT" and self._allow_short and self._short_trigger(df):
+                    # ── Macro trend filter ────────────────────────────────
+                    trend_coeff = self._trend_ctx.get_coefficient("SHORT")
+                    trend_meta = self._trend_ctx.to_meta()
+                    if trend_coeff < self._min_trend_coeff:
+                        self._reset_to_flat()
+                        return hold(
+                            f"short_blocked_by_htf coeff={trend_coeff:.2f}<{self._min_trend_coeff} "
+                            f"htf={trend_meta['htf_direction']} adx={trend_meta['htf_adx_zone']}",
+                            {**base_meta, **trend_meta},
+                        )
                     # Confirmation: candle closed below EMA.
                     # Entry limit = EMA level; SL reference = this candle's HIGH.
                     self._pending_entry_price = cur_ema
@@ -498,8 +580,9 @@ class RSIDivergenceStrategy(BaseStrategy):
                     self._entry_pending_bars = 0
                     self._state = "ENTRY_PENDING"
                     return hold(
-                        f"short_confirmed ema={cur_ema:.4f} conf_high={cur_high:.4f} waiting_limit_fill",
-                        base_meta,
+                        f"short_confirmed ema={cur_ema:.4f} conf_high={cur_high:.4f} "
+                        f"htf_coeff={trend_coeff:.2f} waiting_limit_fill",
+                        {**base_meta, **trend_meta},
                     )
 
                 return hold(
@@ -513,8 +596,12 @@ class RSIDivergenceStrategy(BaseStrategy):
             self._armed_direction = "LONG"
             self._armed_bars_elapsed = 0
             return hold(
-                f"bullish_div_armed swing_low={self._divergence_swing_price:.4f} rsi={self._divergence_swing_rsi:.2f}",
-                base_meta,
+                f"bullish_div_armed "
+                f"sw1_ts={self._div_sw1_ts} sw1_low={self._div_sw1_price:.4f} sw1_rsi={self._div_sw1_rsi:.2f} | "
+                f"sw2_ts={self._div_sw2_ts} sw2_low={self._div_sw2_price:.4f} sw2_rsi={self._div_sw2_rsi:.2f}",
+                {**base_meta,
+                 "div_sw1_ts": self._div_sw1_ts, "div_sw1_price": self._div_sw1_price, "div_sw1_rsi": self._div_sw1_rsi,
+                 "div_sw2_ts": self._div_sw2_ts, "div_sw2_price": self._div_sw2_price, "div_sw2_rsi": self._div_sw2_rsi},
             )
 
         if self._allow_short and self._detect_bearish_divergence(df):
@@ -522,8 +609,12 @@ class RSIDivergenceStrategy(BaseStrategy):
             self._armed_direction = "SHORT"
             self._armed_bars_elapsed = 0
             return hold(
-                f"bearish_div_armed swing_high={self._divergence_swing_price:.4f} rsi={self._divergence_swing_rsi:.2f}",
-                base_meta,
+                f"bearish_div_armed "
+                f"sw1_ts={self._div_sw1_ts} sw1_high={self._div_sw1_price:.4f} sw1_rsi={self._div_sw1_rsi:.2f} | "
+                f"sw2_ts={self._div_sw2_ts} sw2_high={self._div_sw2_price:.4f} sw2_rsi={self._div_sw2_rsi:.2f}",
+                {**base_meta,
+                 "div_sw1_ts": self._div_sw1_ts, "div_sw1_price": self._div_sw1_price, "div_sw1_rsi": self._div_sw1_rsi,
+                 "div_sw2_ts": self._div_sw2_ts, "div_sw2_price": self._div_sw2_price, "div_sw2_rsi": self._div_sw2_rsi},
             )
 
         return hold("no_divergence", base_meta)

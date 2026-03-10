@@ -55,6 +55,8 @@ async def main(args: argparse.Namespace) -> None:
             "allow_short": args.allow_short,
             "sl_buffer_pct": args.sl_buffer_pct,
             "rr_ratio": args.rr_ratio,
+            "tp2_ratio": args.tp2_ratio,
+            "min_trend_coeff": args.min_trend_coeff,
             # Hybrid-only params
             "atr_period": args.atr_period,
             "atr_sl_mult": args.atr_sl_mult,
@@ -78,8 +80,8 @@ async def main(args: argparse.Namespace) -> None:
         print(f"       python scripts/ingest_data.py --symbol {args.symbol} --timeframe {args.timeframe} --start {args.start} --end {args.end}")
         return
 
-    print(f"\nData available: {min_ts} → {max_ts}")
-    print(f"Running backtest: {args.symbol} {args.timeframe} | {start.date()} → {end.date()}")
+    print(f"\nData available: {min_ts} -> {max_ts}")
+    print(f"Running backtest: {args.symbol} {args.timeframe} | {start.date()} -> {end.date()}")
     print(f"Strategy: {strategy.strategy_id}")
     print(f"Initial balance: ${args.balance:,.2f}\n")
 
@@ -92,7 +94,8 @@ async def main(args: argparse.Namespace) -> None:
         verbose=bool(args.output),
     )
 
-    result = await engine.run(args.symbol, args.timeframe, start, end, strategy_params)
+    result = await engine.run(args.symbol, args.timeframe, start, end, strategy_params,
+                              htf_timeframe=args.htf_timeframe)
     report = result.to_report()
 
     print("=" * 60)
@@ -147,7 +150,11 @@ if __name__ == "__main__":
     parser.add_argument("--rsi-overbought", type=float, default=70.0, dest="rsi_overbought")
     parser.add_argument("--allow-short", action="store_true", default=True, dest="allow_short")
     parser.add_argument("--sl-buffer-pct", type=float, default=0.003, dest="sl_buffer_pct")
-    parser.add_argument("--rr-ratio", type=float, default=1.5, dest="rr_ratio")
+    parser.add_argument("--rr-ratio", type=float, default=1.7, dest="rr_ratio")
+    parser.add_argument("--tp2-ratio", type=float, default=2.0, dest="tp2_ratio")
+    parser.add_argument("--min-trend-coeff", type=float, default=0.5, dest="min_trend_coeff")
+    parser.add_argument("--htf-timeframe", default="1h", dest="htf_timeframe",
+                        help="Higher timeframe for macro trend filter (default: 1h)")
 
     # Hybrid RSI Pivot params
     parser.add_argument("--atr-period", type=int, default=14, dest="atr_period")
