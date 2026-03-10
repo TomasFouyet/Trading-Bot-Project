@@ -329,9 +329,19 @@ class BacktestEngine:
                     "meta": signal.meta,
                 })
 
-            # 4. Risk validation
+            # 4. Risk validation — use mark-to-market equity
+            # cash already reflects position cost deducted (LONG) or proceeds received (SHORT)
+            # MTM = cash + qty*close (LONG) or cash - qty*close (SHORT)
             balances = await adapter.get_balance()
-            equity = balances[0].total if balances else self._initial_balance
+            cash = balances[0].total if balances else self._initial_balance
+            equity = cash
+            if open_trade:
+                pos_qty = open_trade["qty"]
+                is_long = open_trade["side"] == TradeSide.LONG.value
+                if is_long:
+                    equity += pos_qty * bar.close
+                else:  # SHORT: subtract current liability
+                    equity -= pos_qty * bar.close
             try:
                 self._risk.update_equity(equity, as_of_date=bar.ts.date())
             except KillSwitchTriggered:
@@ -398,13 +408,7 @@ class BacktestEngine:
                 order, _ = await adapter.place_order(req)
                 close_order_id = order.order_id
 
-            # 6. Equity curve
-            balances = await adapter.get_balance()
-            equity = balances[0].total if balances else self._initial_balance
-            # Mark-to-market: add unrealized PnL from open position
-            if open_trade:
-                unrealized = (bar.close - open_trade["entry_price"]) * open_trade["qty"]
-                equity += unrealized
+            # 6. Equity curve (reuse the MTM equity already computed above)
             result.equity_curve.append({"ts": bar.ts, "equity": equity})
 
         # ── Close any open position at end ────────────────────────────

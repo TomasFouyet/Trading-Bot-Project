@@ -67,8 +67,8 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._trigger_window = int(self.params.get("trigger_window", 10))
 
         # Signal thresholds
-        self._rsi_oversold = float(self.params.get("rsi_oversold", 20.0))
-        self._rsi_overbought = float(self.params.get("rsi_overbought", 80.0))
+        self._rsi_oversold = float(self.params.get("rsi_oversold", 30.0))
+        self._rsi_overbought = float(self.params.get("rsi_overbought", 70.0))
         self._allow_short = bool(self.params.get("allow_short", True))
         self._sl_buffer_pct = float(self.params.get("sl_buffer_pct", 0.003))
         self._rr_ratio = float(self.params.get("rr_ratio", 1.5))
@@ -202,7 +202,7 @@ class RSIDivergenceStrategy(BaseStrategy):
         if pd.isna(rsi1) or pd.isna(rsi2):
             return False
 
-        if price2 < price1 and rsi2 > rsi1 and rsi2 <= self._rsi_oversold:
+        if price2 < price1 and rsi2 > rsi1 and rsi1 <= self._rsi_oversold and rsi2 <= self._rsi_oversold:
             self._divergence_swing_price = float(price2)
             self._divergence_swing_rsi = float(rsi2)
             return True
@@ -228,7 +228,7 @@ class RSIDivergenceStrategy(BaseStrategy):
         if pd.isna(rsi1) or pd.isna(rsi2):
             return False
 
-        if price2 > price1 and rsi2 < rsi1 and rsi2 >= self._rsi_overbought:
+        if price2 > price1 and rsi2 < rsi1 and rsi1 >= self._rsi_overbought and rsi2 >= self._rsi_overbought:
             self._divergence_swing_price = float(price2)
             self._divergence_swing_rsi = float(rsi2)
             return True
