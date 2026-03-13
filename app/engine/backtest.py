@@ -389,21 +389,29 @@ class BacktestEngine:
                     equity += pos_qty * bar.close
                 else:  # SHORT: subtract current liability
                     equity -= pos_qty * bar.close
+            kill_switch_active = False
             try:
                 self._risk.update_equity(equity, as_of_date=bar.ts.date())
             except KillSwitchTriggered:
-                # Daily drawdown limit hit — skip trading this bar (resets next day)
-                result.equity_curve.append({"ts": bar.ts, "equity": equity})
-                continue
+                kill_switch_active = True
 
-            try:
-                approved, reason = self._risk.validate_signal(signal, equity)
-            except Exception as e:
-                logger.warning("backtest_risk_error", error=str(e))
-                break
+            if kill_switch_active:
+                # Daily drawdown limit — allow CLOSE/PARTIAL_CLOSE to protect existing positions,
+                # but skip new entries.
+                if signal.action not in (SignalAction.CLOSE, SignalAction.PARTIAL_CLOSE):
+                    result.equity_curve.append({"ts": bar.ts, "equity": equity})
+                    continue
+                # Fall through so the close signal gets executed below
 
-            if not approved:
-                continue
+            if not kill_switch_active:
+                try:
+                    approved, reason = self._risk.validate_signal(signal, equity)
+                except Exception as e:
+                    logger.warning("backtest_risk_error", error=str(e))
+                    break
+
+                if not approved:
+                    continue
 
             # 5. Execute signal
             if signal.action == SignalAction.BUY and open_trade is None and pending_order_id is None:

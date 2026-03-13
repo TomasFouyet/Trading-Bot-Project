@@ -9,15 +9,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml .
 COPY app/ ./app/
+COPY scripts/ ./scripts/
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -e ".[dev]"
 
-RUN mkdir -p /app/data/parquet
+RUN mkdir -p /app/data/parquet /results
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV C_FORCE_ROOT=true
 ENV PYTHONPATH=/app
 
-CMD ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--queues=data,compute,trading", "--concurrency=2"]
+CMD ["python", "scripts/optimize_rsi_divergence.py", "--help"]

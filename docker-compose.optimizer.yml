@@ -1,0 +1,141 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RSI Divergence parameter optimizer — distributed grid search
+#
+# Cada servicio corre un shard (porción) del grid en paralelo.
+# Los resultados se guardan en ./optimize_results/ del host.
+#
+# Uso rápido (4 shards):
+#   docker compose -f docker-compose.optimizer.yml up --build
+#
+# Aumentar shards: duplicar un bloque optimizer-N y ajustar SHARD.
+#
+# Ver logs en tiempo real:
+#   docker compose -f docker-compose.optimizer.yml logs -f
+#
+# Juntar resultados al terminar:
+#   python scripts/merge_optimize_results.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Variables comunes a todos los optimizadores
+x-optimizer-base: &optimizer-base
+  build:
+    context: .
+    dockerfile: Dockerfile.optimizer
+  # Monta el directorio local de parquet (read-only) y la carpeta de resultados
+  volumes:
+    - ./data/parquet:/app/data/parquet:ro
+    - ./optimize_results:/results
+  environment:
+    PARQUET_DIR: /app/data/parquet
+    LOG_LEVEL: ERROR
+    LOG_FORMAT: console
+    # Sin DB/Redis — el backtest engine es completamente local
+    DATABASE_URL: ""
+    REDIS_URL: ""
+  # Reiniciar solo si falla, no cuando termina normalmente
+  restart: "no"
+
+# ── Configuración del grid (editar aquí para todos los shards) ────────────────
+x-optimizer-args: &optimizer-args
+  SYMBOL:         "BTC-USDT"
+  TIMEFRAME:      "5m"
+  START_DATE:     "2025-11-20"
+  END_DATE:       "2026-03-06"
+  BALANCE:        "10000"
+  WORKERS:        "2"          # Workers por contenedor (2 = seguro para 4 contenedores en 8 cores)
+  TOTAL_SHARDS:   "4"          # Debe coincidir con el número de servicios optimizer-N
+
+services:
+  # ── Shard 1/4 ───────────────────────────────────────────────────────────────
+  optimizer-1:
+    <<: *optimizer-base
+    environment:
+      <<: *optimizer-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+    command: >
+      python scripts/optimize_rsi_divergence.py
+      --symbol      ${SYMBOL:-BTC-USDT}
+      --timeframe   ${TIMEFRAME:-5m}
+      --start       ${START_DATE:-2025-11-20}
+      --end         ${END_DATE:-2026-03-06}
+      --balance     ${BALANCE:-10000}
+      --workers     ${WORKERS:-2}
+      --shard       1
+      --total-shards ${TOTAL_SHARDS:-4}
+      --resume      /results/merged.csv
+      --output      /results/shard_1.csv
+
+  # ── Shard 2/4 ───────────────────────────────────────────────────────────────
+  optimizer-2:
+    <<: *optimizer-base
+    environment:
+      <<: *optimizer-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+    command: >
+      python scripts/optimize_rsi_divergence.py
+      --symbol      ${SYMBOL:-BTC-USDT}
+      --timeframe   ${TIMEFRAME:-5m}
+      --start       ${START_DATE:-2025-11-20}
+      --end         ${END_DATE:-2026-03-06}
+      --balance     ${BALANCE:-10000}
+      --workers     ${WORKERS:-2}
+      --shard       2
+      --total-shards ${TOTAL_SHARDS:-4}
+      --resume      /results/merged.csv
+      --output      /results/shard_2.csv
+
+  # ── Shard 3/4 ───────────────────────────────────────────────────────────────
+  optimizer-3:
+    <<: *optimizer-base
+    environment:
+      <<: *optimizer-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+    command: >
+      python scripts/optimize_rsi_divergence.py
+      --symbol      ${SYMBOL:-BTC-USDT}
+      --timeframe   ${TIMEFRAME:-5m}
+      --start       ${START_DATE:-2025-11-20}
+      --end         ${END_DATE:-2026-03-06}
+      --balance     ${BALANCE:-10000}
+      --workers     ${WORKERS:-2}
+      --shard       3
+      --total-shards ${TOTAL_SHARDS:-4}
+      --resume      /results/merged.csv
+      --output      /results/shard_3.csv
+
+  # ── Shard 4/4 ───────────────────────────────────────────────────────────────
+  optimizer-4:
+    <<: *optimizer-base
+    environment:
+      <<: *optimizer-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+    command: >
+      python scripts/optimize_rsi_divergence.py
+      --symbol      ${SYMBOL:-BTC-USDT}
+      --timeframe   ${TIMEFRAME:-5m}
+      --start       ${START_DATE:-2025-11-20}
+      --end         ${END_DATE:-2026-03-06}
+      --balance     ${BALANCE:-10000}
+      --workers     ${WORKERS:-2}
+      --shard       4
+      --total-shards ${TOTAL_SHARDS:-4}
+      --resume      /results/merged.csv
+      --output      /results/shard_4.csv
+
+# No se necesita sección volumes: — se usan bind mounts locales directamente

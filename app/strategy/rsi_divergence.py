@@ -35,12 +35,9 @@ Parameters:
     rsi_overbought   float, default 70     — RSI threshold for bearish divergence
     allow_short      bool,  default True   — enable SHORT signals
     sl_buffer_pct    float, default 0.003  — SL placed 0.3% beyond swing extreme
-    rr_ratio         float, default 1.7    — TP1 risk:reward ratio (closes 70%)
-    tp2_ratio        float, default 2.0    — TP2 risk:reward ratio (closes remaining 30%)
-    min_trend_coeff  float, default 0.5    — minimum HTF coefficient to allow a trade
-    htf_ema_fast     int,   default 50     — HTF EMA fast period (trend direction)
-    htf_ema_slow     int,   default 200    — HTF EMA slow period (trend direction)
-    htf_adx_period   int,   default 14     — HTF ADX period (trend strength)
+    rr_ratio         float, default 1.5    — risk:reward multiplier for TP
+    trend_ema_period int,   default 50     — Slow EMA for trend filter (0 = disabled)
+    trend_slope_bars int,   default 5      — Bars back to measure trend EMA slope
 """
 from __future__ import annotations
 
@@ -49,6 +46,7 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 from app.strategy.base import BaseStrategy
 from app.strategy.signals import Signal, SignalAction
@@ -95,6 +93,10 @@ class RSIDivergenceStrategy(BaseStrategy):
             ema_slow=int(self.params.get("htf_ema_slow", 200)),
             adx_period=int(self.params.get("htf_adx_period", 14)),
         )
+
+        # Trend filter: slow EMA slope
+        self._trend_ema_period = int(self.params.get("trend_ema_period", 50))
+        self._trend_slope_bars = int(self.params.get("trend_slope_bars", 5))
 
         # State machine:
         #   FLAT → ARMED → ENTRY_PENDING → LONG    → LONG_BE  → FLAT
@@ -176,6 +178,12 @@ class RSIDivergenceStrategy(BaseStrategy):
         # EMA trigger
         df["ema"] = closes.ewm(span=self._ema_period, adjust=False).mean()
 
+        # Trend filter slow EMA (disabled when trend_ema_period == 0)
+        if self._trend_ema_period > 0:
+            df["trend_ema"] = closes.ewm(span=self._trend_ema_period, adjust=False).mean()
+        else:
+            df["trend_ema"] = np.nan
+
         return df
 
     # ── Swing detection ───────────────────────────────────────────────────────
@@ -183,41 +191,55 @@ class RSIDivergenceStrategy(BaseStrategy):
     def _find_swing_lows(self, df: pd.DataFrame) -> list[int]:
         """
         Return indices of confirmed swing lows within the lookback window.
-        A pivot low at i requires: low[i] < low[i±k] for all k in 1..swing_window.
-        Excludes the last swing_window bars (right side not yet confirmed).
-        """
-        n = len(df)
-        w = self._swing_window
-        search_start = max(w, n - self._swing_lookback - w)
-        search_end = n - w  # exclusive
-
-        lows = df["low"].values
-        indices = []
-        for i in range(search_start, search_end):
-            v = lows[i]
-            if all(v < lows[i - k] for k in range(1, w + 1)) and \
-               all(v < lows[i + k] for k in range(1, w + 1)):
-                indices.append(i)
-        return indices
-
-    def _find_swing_highs(self, df: pd.DataFrame) -> list[int]:
-        """
-        Return indices of confirmed swing highs within the lookback window.
-        A pivot high at i requires: high[i] > high[i±k] for all k in 1..swing_window.
+        Vectorized with numpy sliding_window_view — O(n) instead of O(n*w).
+        A pivot low at i: low[i] < min(low[i-w:i]) AND low[i] < min(low[i+1:i+w+1]).
         """
         n = len(df)
         w = self._swing_window
         search_start = max(w, n - self._swing_lookback - w)
         search_end = n - w
+        if search_start >= search_end or n < 2 * w + 1:
+            return []
+
+        lows = df["low"].values
+
+        # left_windows[j]  = lows[j : j+w]  → min = min of w values before position j+w
+        # So for position i: left_min = left_windows[i-w].min() = min(lows[i-w:i])
+        left_windows  = sliding_window_view(lows[:-1], w)   # shape (n-w, w)
+        # right_windows[i] = lows[i+1 : i+w+1]
+        right_windows = sliding_window_view(lows[1:],  w)   # shape (n-w, w)
+
+        i_range   = np.arange(search_start, search_end)
+        center    = lows[i_range]
+        left_min  = left_windows[i_range - w].min(axis=1)
+        right_min = right_windows[i_range].min(axis=1)
+
+        return list(i_range[(center < left_min) & (center < right_min)])
+
+    def _find_swing_highs(self, df: pd.DataFrame) -> list[int]:
+        """
+        Return indices of confirmed swing highs within the lookback window.
+        Vectorized with numpy sliding_window_view — O(n) instead of O(n*w).
+        A pivot high at i: high[i] > max(high[i-w:i]) AND high[i] > max(high[i+1:i+w+1]).
+        """
+        n = len(df)
+        w = self._swing_window
+        search_start = max(w, n - self._swing_lookback - w)
+        search_end = n - w
+        if search_start >= search_end or n < 2 * w + 1:
+            return []
 
         highs = df["high"].values
-        indices = []
-        for i in range(search_start, search_end):
-            v = highs[i]
-            if all(v > highs[i - k] for k in range(1, w + 1)) and \
-               all(v > highs[i + k] for k in range(1, w + 1)):
-                indices.append(i)
-        return indices
+
+        left_windows  = sliding_window_view(highs[:-1], w)
+        right_windows = sliding_window_view(highs[1:],  w)
+
+        i_range    = np.arange(search_start, search_end)
+        center     = highs[i_range]
+        left_max   = left_windows[i_range - w].max(axis=1)
+        right_max  = right_windows[i_range].max(axis=1)
+
+        return list(i_range[(center > left_max) & (center > right_max)])
 
     # ── Divergence detection ──────────────────────────────────────────────────
 
@@ -286,6 +308,46 @@ class RSIDivergenceStrategy(BaseStrategy):
             self._div_sw2_rsi = float(rsi2)
             return True
         return False
+
+    # ── Trend filter ──────────────────────────────────────────────────────────
+
+    def _trend_is_up(self, df: pd.DataFrame) -> bool:
+        """
+        Returns True if the slow EMA is rising (uptrend).
+        Disabled (always True) when trend_ema_period == 0.
+        """
+        if self._trend_ema_period == 0:
+            return True
+        col = df.get("trend_ema")
+        if col is None:
+            return True
+        n = len(df)
+        if n < self._trend_slope_bars + 1:
+            return True
+        cur = float(df["trend_ema"].iloc[-1])
+        prev = float(df["trend_ema"].iloc[-1 - self._trend_slope_bars])
+        if pd.isna(cur) or pd.isna(prev):
+            return True
+        return cur > prev
+
+    def _trend_is_down(self, df: pd.DataFrame) -> bool:
+        """
+        Returns True if the slow EMA is falling (downtrend).
+        Disabled (always True) when trend_ema_period == 0.
+        """
+        if self._trend_ema_period == 0:
+            return True
+        col = df.get("trend_ema")
+        if col is None:
+            return True
+        n = len(df)
+        if n < self._trend_slope_bars + 1:
+            return True
+        cur = float(df["trend_ema"].iloc[-1])
+        prev = float(df["trend_ema"].iloc[-1 - self._trend_slope_bars])
+        if pd.isna(cur) or pd.isna(prev):
+            return True
+        return cur < prev
 
     # ── EMA trigger checks ────────────────────────────────────────────────────
 
@@ -592,6 +654,11 @@ class RSIDivergenceStrategy(BaseStrategy):
 
         # ── FLAT: scan for divergence ─────────────────────────────────
         if self._detect_bullish_divergence(df):
+            if not self._trend_is_up(df):
+                return hold(
+                    f"bullish_div_rejected_by_trend swing_low={self._divergence_swing_price:.4f}",
+                    base_meta,
+                )
             self._state = "ARMED"
             self._armed_direction = "LONG"
             self._armed_bars_elapsed = 0
@@ -605,6 +672,11 @@ class RSIDivergenceStrategy(BaseStrategy):
             )
 
         if self._allow_short and self._detect_bearish_divergence(df):
+            if not self._trend_is_down(df):
+                return hold(
+                    f"bearish_div_rejected_by_trend swing_high={self._divergence_swing_price:.4f}",
+                    base_meta,
+                )
             self._state = "ARMED"
             self._armed_direction = "SHORT"
             self._armed_bars_elapsed = 0
@@ -623,7 +695,7 @@ class RSIDivergenceStrategy(BaseStrategy):
 
     def compute_indicators(self, bars: pd.DataFrame) -> pd.DataFrame:
         """
-        Returns bars enriched with rsi, ema, swing_low (bool), swing_high (bool).
+        Returns bars enriched with rsi, ema, trend_ema, swing_low (bool), swing_high (bool).
         Useful for visualization and reporting.
         """
         df = self._compute_indicators(bars)
