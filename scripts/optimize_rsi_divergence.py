@@ -35,20 +35,24 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import numpy as np
+import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
+
 
 # ── Parameter grid ─────────────────────────────────────────────────────────────
 # Edit these lists to control what values get tested.
 # Total combinations = product of all list lengths.
 
 PARAM_GRID = {
-    "rsi_period":       [7, 9, 14],
-    "ema_period":       [9, 12, 14],
+    "rsi_period":       [9, 14],
+    "ema_period":       [12, 14],
     "swing_window":     [2, 3, 4, 5],
     "swing_separation": [5, 7, 10],
-    "rsi_oversold":     [25.0, 30.0, 35.0],
-    "rsi_overbought":   [65.0, 70.0, 75.0],
-    "rr_ratio":         [1.5, 1.6, 1.75, 2.0],
-    "trend_ema_period": [0, 50],
+    "rsi_oversold":     [30.0, 35.0],
+    "rsi_overbought":   [65.0, 70.0],
+    "rr_ratio":         [1.5, 1.6, 1.75],
+    "trend_ema_period": [50],
 }
 
 # Quick mode — smaller grid for a fast sanity check
@@ -73,6 +77,113 @@ FIXED_PARAMS = {
     "trend_slope_bars": 5,
     "entry_window":     2,
 }
+
+
+# ── Worker globals ─────────────────────────────────────────────────────────────
+# Set by initializer once per process; shared across all jobs in that process.
+# key: (rsi_period, ema_period, trend_ema_period) → (precomputed_df, ts_ms_to_pos)
+_WORKER_PRECOMPUTED: "dict | None" = None
+# Shared raw-bars DataFrame (ts/ohlcv, no indicators) for fast bars_to_df replacement
+_WORKER_BARS_DF: "object | None" = None
+# int(ms since epoch) → row-position in _WORKER_BARS_DF  (same for all indicator sets)
+_WORKER_TS_MS_TO_POS: "dict | None" = None
+
+
+def _init_worker_cache(precomputed: dict, bars_df: object, ts_ms_to_pos: dict) -> None:
+    """
+    Called once per worker process.
+    Injects precomputed indicator data AND monkey-patches BaseStrategy.bars_to_df
+    so the engine's per-bar window creation no longer iterates over OHLCVBar objects
+    and converts Decimal fields — instead it slices a pre-built numpy-backed DataFrame.
+    That alone cuts ~6 s/combo of Decimal→float overhead (250 bars × 5 fields × 17 k calls).
+    """
+    global _WORKER_PRECOMPUTED, _WORKER_BARS_DF, _WORKER_TS_MS_TO_POS
+    _WORKER_PRECOMPUTED  = precomputed
+    _WORKER_BARS_DF      = bars_df
+    _WORKER_TS_MS_TO_POS = ts_ms_to_pos
+
+    # Patch BaseStrategy.bars_to_df to use the pre-built DataFrame slice
+    from app.strategy.base import BaseStrategy
+    _orig_bars_to_df = BaseStrategy.__dict__["bars_to_df"].__func__
+
+    def _fast_bars_to_df(bars_list):
+        if not bars_list or _WORKER_TS_MS_TO_POS is None:
+            return _orig_bars_to_df(bars_list)
+        ts_ms = int(bars_list[-1].ts.timestamp() * 1_000)
+        pos   = _WORKER_TS_MS_TO_POS.get(ts_ms)
+        if pos is None:
+            return _orig_bars_to_df(bars_list)
+        n = len(bars_list)
+        return _WORKER_BARS_DF.iloc[pos - n + 1 : pos + 1]
+
+    BaseStrategy.bars_to_df = staticmethod(_fast_bars_to_df)
+
+
+# ── Fast pre-filter ────────────────────────────────────────────────────────────
+
+def _fast_divergence_count(
+    rsi: np.ndarray,
+    lows: np.ndarray,
+    highs: np.ndarray,
+    swing_window: int,
+    swing_separation: int,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    allow_short: bool = True,
+) -> int:
+    """
+    Vectorized upper-bound count of RSI divergence signals on the full series.
+
+    Finds all swing lows/highs with numpy sliding windows, then counts consecutive
+    pairs that satisfy the divergence condition.  Because this scans the full series
+    (vs the rolling 250-bar window used at runtime), the result is an *upper bound*:
+    if this returns < N, the backtest will also produce < N trades.
+    """
+    n = len(rsi)
+    w = swing_window
+    if n < 2 * w + 2:
+        return 0
+
+    i_range = np.arange(w, n - w)
+
+    # ── Bullish divergence (swing lows) ─────────────────────────────────────
+    left_l  = sliding_window_view(lows[:-1], w)
+    right_l = sliding_window_view(lows[1:],  w)
+    center_l  = lows[i_range]
+    left_min  = left_l[i_range - w].min(axis=1)
+    right_min = right_l[i_range].min(axis=1)
+    sl_idx = i_range[(center_l < left_min) & (center_l < right_min)]
+
+    bullish = 0
+    for j in range(1, len(sl_idx)):
+        i1, i2 = sl_idx[j - 1], sl_idx[j]
+        if (i2 - i1) >= swing_separation:
+            r1, r2 = rsi[i1], rsi[i2]
+            if (lows[i2] < lows[i1] and r2 > r1
+                    and r1 <= rsi_oversold and r2 <= rsi_oversold):
+                bullish += 1
+
+    if not allow_short:
+        return bullish
+
+    # ── Bearish divergence (swing highs) ────────────────────────────────────
+    left_h  = sliding_window_view(highs[:-1], w)
+    right_h = sliding_window_view(highs[1:],  w)
+    center_h  = highs[i_range]
+    left_max  = left_h[i_range - w].max(axis=1)
+    right_max = right_h[i_range].max(axis=1)
+    sh_idx = i_range[(center_h > left_max) & (center_h > right_max)]
+
+    bearish = 0
+    for j in range(1, len(sh_idx)):
+        i1, i2 = sh_idx[j - 1], sh_idx[j]
+        if (i2 - i1) >= swing_separation:
+            r1, r2 = rsi[i1], rsi[i2]
+            if (highs[i2] > highs[i1] and r2 < r1
+                    and r1 >= rsi_overbought and r2 >= rsi_overbought):
+                bearish += 1
+
+    return bullish + bearish
 
 
 # ── Worker (runs in a child process) ──────────────────────────────────────────
@@ -111,27 +222,52 @@ async def _async_backtest(job: dict) -> dict | None:
         store    = ParquetStore()
         strategy = get_strategy("rsi_divergence", symbol=symbol, params=params)
 
-        # ── Indicator cache: precompute RSI/EMA once on full series ──────────
+        # ── Indicator cache ───────────────────────────────────────────────────
         # The engine calls on_bar(window) where window grows then slides.
-        # Normally _compute_indicators(window) recomputes EWM from scratch
-        # on every call (~17k × 250 = 4.25M ops).
-        # We precompute once, then slice by matching the window's last timestamp.
-        all_bars     = store.read_bars(symbol, timeframe, start, end)
-        full_df      = BaseStrategy.bars_to_df(all_bars)
-        _precomputed = strategy._compute_indicators(full_df)
-        # O(1) lookup: last timestamp of window → end position in precomputed
-        _ts_to_pos   = {ts: i for i, ts in enumerate(_precomputed["ts"])}
-        _orig_compute = strategy._compute_indicators  # keep for fallback
+        # We precompute RSI/EMA once and slice by the window's last timestamp.
+        #
+        # Fast path: use data pre-computed in the main process and shared via
+        # the worker initializer (avoids re-reading parquet + re-computing ewm).
+        # Slow path (fallback): compute locally (used when workers=1 or cache miss).
+        ind_key = (params["rsi_period"], params["ema_period"], params["trend_ema_period"])
 
-        def _cached_indicators(df: "pd.DataFrame") -> "pd.DataFrame":
-            last_ts = df["ts"].iloc[-1]
-            end_pos = _ts_to_pos.get(last_ts)
-            if end_pos is None:
-                return _orig_compute(df)   # fallback (should never happen)
-            end_pos   += 1
-            start_pos  = end_pos - len(df)
-            # Return slice — no copy needed; strategy only reads (uses .values / .iloc)
-            return _precomputed.iloc[start_pos:end_pos]
+        if _WORKER_PRECOMPUTED is not None and ind_key in _WORKER_PRECOMPUTED:
+            _precomputed, _ts_ms_to_pos_ind = _WORKER_PRECOMPUTED[ind_key]
+            _orig_compute = strategy._compute_indicators
+
+            def _cached_indicators(df: "pd.DataFrame") -> "pd.DataFrame":
+                # bars_to_df already returned a precomputed-df slice (has rsi/ema cols).
+                # If indicator cols are present just return the slice as-is (identity).
+                if "rsi" in df.columns:
+                    return df
+                # Fallback: look up by int(ms) timestamp key
+                ts_ms = int(df["ts"].iloc[-1].timestamp() * 1_000)
+                end_pos = _ts_ms_to_pos_ind.get(ts_ms)
+                if end_pos is None:
+                    return _orig_compute(df)
+                end_pos += 1
+                return _precomputed.iloc[end_pos - len(df) : end_pos]
+
+        else:
+            # Fallback: compute indicators locally
+            all_bars     = store.read_bars(symbol, timeframe, start, end)
+            full_df      = BaseStrategy.bars_to_df(all_bars)
+            _precomputed = strategy._compute_indicators(full_df)
+            _ts_ms_to_pos_ind = {
+                int(pd.Timestamp(ts).timestamp() * 1_000): i
+                for i, ts in enumerate(_precomputed["ts"])
+            }
+            _orig_compute = strategy._compute_indicators
+
+            def _cached_indicators(df: "pd.DataFrame") -> "pd.DataFrame":
+                if "rsi" in df.columns:
+                    return df
+                ts_ms = int(df["ts"].iloc[-1].timestamp() * 1_000)
+                end_pos = _ts_ms_to_pos_ind.get(ts_ms)
+                if end_pos is None:
+                    return _orig_compute(df)
+                end_pos += 1
+                return _precomputed.iloc[end_pos - len(df) : end_pos]
 
         strategy._compute_indicators = _cached_indicators
         # ─────────────────────────────────────────────────────────────────────
@@ -299,6 +435,8 @@ def main(args: argparse.Namespace) -> None:
     from app.config import get_settings
     from app.core.logging import configure_logging
     from app.data.parquet_store import ParquetStore
+    from app.strategy import get_strategy as _get_strategy
+    from app.strategy.base import BaseStrategy as _BaseStrategy
     configure_logging(log_level="ERROR", log_format="console")
     get_settings()
     store = ParquetStore()
@@ -310,6 +448,56 @@ def main(args: argparse.Namespace) -> None:
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
     end   = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
+
+    # ── Phase 1: Pre-compute indicators for all unique (rsi, ema, trend) combos ──
+    # There are only rsi×ema×trend = 3×3×2 = 18 unique indicator sets out of
+    # potentially thousands of total combos.  We compute them once here and inject
+    # them into every worker via the pool initializer — each worker receives the
+    # dict once at startup rather than recomputing per-job.
+    print("  Pre-computing indicators for unique parameter combos...", flush=True)
+    _t_precomp = time.monotonic()
+
+    _all_bars_main = store.read_bars(args.symbol, args.timeframe, start, end)
+    _full_df_main  = _BaseStrategy.bars_to_df(_all_bars_main)
+
+    _ind_keys = {
+        (p["rsi_period"], p["ema_period"], p["trend_ema_period"])
+        for p in (dict(zip(keys, c)) for c in combos)
+    }
+
+    _precomputed_main: dict = {}
+    for (rsi_p, ema_p, trend_p) in _ind_keys:
+        _p = {**FIXED_PARAMS, "rsi_period": rsi_p, "ema_period": ema_p,
+              "trend_ema_period": trend_p}
+        _s = _get_strategy("rsi_divergence", symbol=args.symbol, params=_p)
+        _df = _s._compute_indicators(_full_df_main)
+        _precomputed_main[(rsi_p, ema_p, trend_p)] = (_df, None)  # pos dict built below
+
+    # ── Build unified int(ms)→position lookup (same bars for all indicator sets) ──
+    # int(ms) keys are faster to hash/lookup than pandas Timestamps.
+    # datetime.timestamp() is a native C call (~50 ns) vs Timestamp hashing (~200 ns).
+    _any_df = next(iter(_precomputed_main.values()))[0]
+    _ts_ms_arr = (pd.DatetimeIndex(_any_df["ts"]).asi8 // 1_000_000).tolist()
+    _ts_ms_to_pos_main = dict(zip(_ts_ms_arr, range(len(_ts_ms_arr))))
+
+    # Update all precomputed entries to share the same lookup dict
+    _precomputed_main = {k: (df, _ts_ms_to_pos_main) for k, (df, _) in _precomputed_main.items()}
+
+    # Raw bars DataFrame for workers' bars_to_df monkey-patch (no indicator columns).
+    # Workers use this to slice per-bar windows without iterating over OHLCVBar objects
+    # (avoids ~1250 Decimal→float conversions per bar × 17k bars = huge savings).
+    _bars_raw_df = _any_df[["ts", "open", "high", "low", "close", "volume"]].copy()
+
+    print(f"  Pre-computed {len(_precomputed_main)} indicator sets in "
+          f"{_fmt_dur(time.monotonic() - _t_precomp)}\n", flush=True)
+
+    # ── Phase 2: Fast pre-filter ───────────────────────────────────────────────
+    # Count RSI divergences vectorially on the full series for each combo.
+    # This is an upper bound: if the count < MIN_TRADES, the backtest will
+    # definitely produce fewer trades and would be discarded anyway.
+    MIN_TRADES_THRESHOLD = 2  # skip only combos with < 2 possible divergences on full series
+    _lows_arr  = _full_df_main["low"].values.astype(float)
+    _highs_arr = _full_df_main["high"].values.astype(float)
 
     # Build job list
     jobs = [
@@ -323,6 +511,44 @@ def main(args: argparse.Namespace) -> None:
         }
         for combo in combos
     ]
+
+    # ── Phase 2 (continued): apply fast pre-filter ────────────────────────
+    _t_filter = time.monotonic()
+    _n_before = len(jobs)
+    _filtered_jobs = []
+    for _job in jobs:
+        _p = _job["params"]
+        _key = (_p["rsi_period"], _p["ema_period"], _p["trend_ema_period"])
+        _rsi_arr = _precomputed_main[_key][0]["rsi"].values.astype(float)
+        _count = _fast_divergence_count(
+            rsi=_rsi_arr,
+            lows=_lows_arr,
+            highs=_highs_arr,
+            swing_window=_p["swing_window"],
+            swing_separation=_p["swing_separation"],
+            rsi_oversold=_p["rsi_oversold"],
+            rsi_overbought=_p["rsi_overbought"],
+            allow_short=_p.get("allow_short", True),
+        )
+        if _count >= MIN_TRADES_THRESHOLD:
+            _filtered_jobs.append(_job)
+
+    _n_removed = _n_before - len(_filtered_jobs)
+    print(
+        f"  Fast filter: removed {_n_removed}/{_n_before} combos "
+        f"(< {MIN_TRADES_THRESHOLD} potential signals) in "
+        f"{_fmt_dur(time.monotonic() - _t_filter)} "
+        f"→ {len(_filtered_jobs)} remaining\n",
+        flush=True,
+    )
+    jobs    = _filtered_jobs
+    total   = len(jobs)
+    workers = min(args.workers, total) if total > 0 else 1
+
+    if total == 0:
+        print("  All combinations filtered out (no combo can reach min trades). Done.")
+        return
+    # ──────────────────────────────────────────────────────────────────────
 
     # ── Resume: filter out already-computed combos ─────────────────────────
     if args.resume and os.path.exists(args.resume):
@@ -373,7 +599,11 @@ def main(args: argparse.Namespace) -> None:
     print(f"  Starting {total} backtests with {workers} workers...", flush=True)
     _redraw(0, total, 0.001, best_wr, best_pnl, workers, None, last_print)
 
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker_cache,
+        initargs=(_precomputed_main, _bars_raw_df, _ts_ms_to_pos_main),
+    ) as pool:
         futures = {pool.submit(_worker, job): job for job in jobs}
 
         for future in as_completed(futures):

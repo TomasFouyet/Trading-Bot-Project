@@ -59,7 +59,7 @@ def main(args: argparse.Namespace) -> None:
     if args.files:
         files = args.files
     else:
-        pattern = os.path.join(args.input_dir, "shard_*.csv")
+        pattern = os.path.join(args.input_dir, "merged_*.csv")
         files = sorted(glob.glob(pattern))
 
     if not files:

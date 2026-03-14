@@ -57,6 +57,19 @@ async def main(args: argparse.Namespace) -> None:
             "rr_ratio": args.rr_ratio,
             "tp2_ratio": args.tp2_ratio,
             "min_trend_coeff": args.min_trend_coeff,
+            "trend_ema_period": args.trend_ema_period,
+            "trend_slope_bars": args.trend_slope_bars,
+            "entry_window": args.entry_window,
+            "max_concurrent_positions": args.max_concurrent,
+            # Cali technique filters
+            "use_ema_cross_filter": args.use_ema_cross_filter,
+            "ema_fast_filter": args.ema_fast_filter,
+            "ema_slow_filter": args.ema_slow_filter,
+            "vol_confirm_enabled": args.vol_confirm_enabled,
+            "vol_confirm_period": args.vol_confirm_period,
+            "sr_zone_enabled": args.sr_zone_enabled,
+            "sr_zone_pct": args.sr_zone_pct,
+            "tp1_close_pct": args.tp1_close_pct,
             # Hybrid-only params
             "atr_period": args.atr_period,
             "atr_sl_mult": args.atr_sl_mult,
@@ -150,11 +163,42 @@ if __name__ == "__main__":
     parser.add_argument("--rsi-overbought", type=float, default=70.0, dest="rsi_overbought")
     parser.add_argument("--allow-short", action="store_true", default=True, dest="allow_short")
     parser.add_argument("--sl-buffer-pct", type=float, default=0.003, dest="sl_buffer_pct")
-    parser.add_argument("--rr-ratio", type=float, default=1.7, dest="rr_ratio")
-    parser.add_argument("--tp2-ratio", type=float, default=2.0, dest="tp2_ratio")
+    parser.add_argument("--rr-ratio", type=float, default=1.5, dest="rr_ratio",
+                        help="TP1 risk:reward ratio (optimizer default: 1.5–1.75)")
+    parser.add_argument("--tp2-ratio", type=float, default=1.75, dest="tp2_ratio",
+                        help="TP2 risk:reward ratio (optimizer FIXED default: 1.75)")
     parser.add_argument("--min-trend-coeff", type=float, default=0.5, dest="min_trend_coeff")
+    parser.add_argument("--trend-ema-period", type=int, default=50, dest="trend_ema_period",
+                        help="Slow EMA period for LTF slope filter (0 = disabled)")
+    parser.add_argument("--trend-slope-bars", type=int, default=5, dest="trend_slope_bars",
+                        help="Bars back to measure trend EMA slope")
+    parser.add_argument("--entry-window", type=int, default=2, dest="entry_window",
+                        help="Bars to wait for limit fill after EMA confirmation")
+    parser.add_argument("--max-concurrent", type=int, default=1, dest="max_concurrent",
+                        help="Max simultaneous open positions (1 = classic single-trade mode)")
     parser.add_argument("--htf-timeframe", default="1h", dest="htf_timeframe",
                         help="Higher timeframe for macro trend filter (default: 1h)")
+
+    # Cali technique filters
+    parser.add_argument("--use-ema-cross-filter", action="store_true", default=False,
+                        dest="use_ema_cross_filter",
+                        help="Require EMA_fast > EMA_slow for LONG (EMA7/EMA25 by default)")
+    parser.add_argument("--ema-fast-filter", type=int, default=7, dest="ema_fast_filter",
+                        help="Fast EMA for cross filter (default: 7)")
+    parser.add_argument("--ema-slow-filter", type=int, default=25, dest="ema_slow_filter",
+                        help="Slow EMA for cross filter (default: 25)")
+    parser.add_argument("--vol-confirm-enabled", action="store_true", default=False,
+                        dest="vol_confirm_enabled",
+                        help="Require volume >= 80%% of vol_ma before entry")
+    parser.add_argument("--vol-confirm-period", type=int, default=20, dest="vol_confirm_period",
+                        help="Rolling window for volume moving average (default: 20)")
+    parser.add_argument("--sr-zone-enabled", action="store_true", default=False,
+                        dest="sr_zone_enabled",
+                        help="Require price near an HTF S/R zone (Pupupu zones)")
+    parser.add_argument("--sr-zone-pct", type=float, default=0.005, dest="sr_zone_pct",
+                        help="Proximity threshold for S/R zones as fraction of price (default: 0.005 = 0.5%%)")
+    parser.add_argument("--tp1-close-pct", type=float, default=0.70, dest="tp1_close_pct",
+                        help="Fraction of position closed at TP1 (Cali recommends 0.75)")
 
     # Hybrid RSI Pivot params
     parser.add_argument("--atr-period", type=int, default=14, dest="atr_period")
