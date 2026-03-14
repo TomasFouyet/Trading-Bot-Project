@@ -254,7 +254,15 @@ class BacktestEngine:
 
                     if pid in open_trades:
                         trade = open_trades[pid]
-                        exit_price = fill.price
+                        # Use the strategy-provided limit price (TP/SL level) when available,
+                        # so PnL reflects the actual trigger level rather than next-bar open.
+                        intended_price = pc.get("limit_price")
+                        if intended_price is not None:
+                            exit_price = Decimal(str(intended_price))
+                            fee_out = exit_price * fill.qty * self._commission
+                        else:
+                            exit_price = fill.price
+                            fee_out = fill.fee
                         entry_price = trade["entry_price"]
                         closed_qty = fill.qty
                         is_long = trade["side"] == "LONG"
@@ -265,7 +273,6 @@ class BacktestEngine:
 
                         pct_of_orig = closed_qty / trade["original_qty"]
                         fee_in_part = trade["fee_in"] * pct_of_orig
-                        fee_out = fill.fee
                         net_pnl = gross_pnl - fee_in_part - fee_out
 
                         trade["total_partial_pnl"] += net_pnl
@@ -422,6 +429,7 @@ class BacktestEngine:
                                 "position_id": target_trade["position_id"],
                                 "close_pct": close_pct,
                                 "exit_type": sig.meta.get("exit_type", "tp1"),
+                                "limit_price": sig.meta.get("exit_price"),
                             }
 
                 # ── Full close ─────────────────────────────────────────────
@@ -446,6 +454,7 @@ class BacktestEngine:
                             "position_id": target_trade["position_id"],
                             "close_pct": 1.0,
                             "exit_type": sig.meta.get("exit_type", "close"),
+                            "limit_price": sig.meta.get("exit_price"),
                         }
 
             # Handle fills queued by the close orders placed above
@@ -497,7 +506,13 @@ class BacktestEngine:
                         pid = pc["position_id"]
                         if pid in open_trades:
                             trade = open_trades[pid]
-                            exit_price = fill.price
+                            intended_price = pc.get("limit_price")
+                            if intended_price is not None:
+                                exit_price = Decimal(str(intended_price))
+                                fee_out = exit_price * fill.qty * self._commission
+                            else:
+                                exit_price = fill.price
+                                fee_out = fill.fee
                             entry_price = trade["entry_price"]
                             closed_qty = fill.qty
                             is_long = trade["side"] == "LONG"
@@ -505,7 +520,6 @@ class BacktestEngine:
                             gross_pnl = price_diff * closed_qty
                             pct_of_orig = closed_qty / trade["original_qty"]
                             fee_in_part = trade["fee_in"] * pct_of_orig
-                            fee_out = fill.fee
                             net_pnl = gross_pnl - fee_in_part - fee_out
                             trade["total_partial_pnl"] += net_pnl
                             trade["total_partial_fees"] += fee_in_part + fee_out
