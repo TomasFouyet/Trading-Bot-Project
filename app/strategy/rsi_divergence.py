@@ -46,6 +46,7 @@ Parameters:
     htf_ema_slow            int,   default 200    — HTF slow EMA
     htf_adx_period          int,   default 14     — HTF ADX period
     entry_window            int,   default 2      — bars to wait for limit fill
+    entry_cooldown_bars     int,   default 5      — min bars between consecutive entry signals
     max_concurrent_positions int,  default 1      — max simultaneous open positions
 """
 from __future__ import annotations
@@ -85,14 +86,15 @@ class RSIDivergenceStrategy(BaseStrategy):
         self._trigger_window = int(self.params.get("trigger_window", 10))
 
         # Signal thresholds
-        self._rsi_oversold = float(self.params.get("rsi_oversold", 40.0))
-        self._rsi_overbought = float(self.params.get("rsi_overbought", 60.0))
+        self._rsi_oversold = float(self.params.get("rsi_oversold", 35.0))
+        self._rsi_overbought = float(self.params.get("rsi_overbought", 75.0))
         self._allow_short = bool(self.params.get("allow_short", True))
         self._sl_buffer_pct = float(self.params.get("sl_buffer_pct", 0.003))
         self._rr_ratio = float(self.params.get("rr_ratio", 1.5))
         self._tp2_ratio = float(self.params.get("tp2_ratio", 1.75))
         self._min_trend_coeff = float(self.params.get("min_trend_coeff", 0.5))
         self._entry_window = int(self.params.get("entry_window", 15))
+        self._entry_cooldown = int(self.params.get("entry_cooldown_bars", 5))
 
         # Multi-position
         self._max_concurrent = int(self.params.get("max_concurrent_positions", 5))
@@ -107,6 +109,9 @@ class RSIDivergenceStrategy(BaseStrategy):
         # ── Scanner context (one active scanner at a time) ──────────────────
         # Detects divergences and manages ARM → ENTRY_PENDING → fill
         self._scan: dict = self._new_scan()
+
+        # Cooldown: bars elapsed since last entry signal (starts ready)
+        self._bars_since_last_entry: int = self._entry_cooldown
 
         # ── Open positions (list of dicts) ─────────────────────────────────
         # Each dict: {id, side, state, entry_price, sl_price, tp1_price, tp2_price}
@@ -399,6 +404,7 @@ class RSIDivergenceStrategy(BaseStrategy):
                     "sl_price": sl, "tp1_price": tp1, "tp2_price": tp2,
                 })
                 self._scan = self._new_scan()
+                self._bars_since_last_entry = 0
                 signals.append(Signal(
                     action=SignalAction.BUY,
                     symbol=self.symbol, ts=ts,
@@ -429,6 +435,7 @@ class RSIDivergenceStrategy(BaseStrategy):
                     "sl_price": sl, "tp1_price": tp1, "tp2_price": tp2,
                 })
                 self._scan = self._new_scan()
+                self._bars_since_last_entry = 0
                 signals.append(Signal(
                     action=SignalAction.SELL,
                     symbol=self.symbol, ts=ts,
@@ -511,6 +518,11 @@ class RSIDivergenceStrategy(BaseStrategy):
                 )]
 
         # ── FLAT: scan for divergence ──────────────────────────────────────
+        if self._bars_since_last_entry < self._entry_cooldown:
+            return [hold(
+                f"cooldown {self._bars_since_last_entry}/{self._entry_cooldown}",
+            )]
+
         if self._detect_bullish_divergence(df):
             s = self._scan
             s["state"] = "ARMED"
@@ -595,6 +607,10 @@ class RSIDivergenceStrategy(BaseStrategy):
         cur_low   = float(df["low"].iloc[-1])
         cur_ema   = float(df["ema"].iloc[-1]) if not pd.isna(df["ema"].iloc[-1]) else 0.0
         cur_rsi   = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
+
+        # Advance cooldown counter (capped so it doesn't grow unbounded)
+        if self._bars_since_last_entry < self._entry_cooldown:
+            self._bars_since_last_entry += 1
 
         base_meta = {"rsi": round(cur_rsi, 2), "ema": round(cur_ema, 4)}
 

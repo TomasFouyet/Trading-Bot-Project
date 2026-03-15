@@ -262,6 +262,7 @@ code { background: var(--bg3); padding: 2px 6px; border-radius: 3px; font-size: 
   <button class="btn active" id="btn-show-tp">TP1</button>
   <button class="btn active" id="btn-show-tp2">TP2</button>
   <button class="btn active" id="btn-show-entry">Entrada</button>
+  <button class="btn active" id="btn-show-hl" title="Resaltar velas de setup, entrada, TP y SL">Marcas</button>
 </div>
 
 <!-- Progress -->
@@ -411,7 +412,7 @@ ro.observe(document.getElementById('chart-rsi'));
 window.addEventListener('load', () => { ro.disconnect(); ro.observe(document.getElementById('chart-price')); ro.observe(document.getElementById('chart-rsi')); });
 
 // Line visibility
-let showSL = true, showTP = true, showTP2 = true, showEntry = true;
+let showSL = true, showTP = true, showTP2 = true, showEntry = true, showHighlights = true;
 const toggleLine = (series, key) => {
   series.applyOptions({ visible: key });
 };
@@ -432,6 +433,13 @@ let entryMap = {}, exitMap = {};
 let activeTrade = null;
 let tradeFilter = 'all';
 let maxEquity = 10000;
+
+// Special candle highlight sets (unix timestamps)
+let pendingUnix  = new Set();  // ENTRY_PENDING setup bars (amber border/wick)
+let signalUnix   = new Set();  // BUY/SELL signal trigger bar (bright orange)
+let entryFillUnix = new Set(); // entry fill bar from trades (blue tint)
+let tpExitUnix   = new Set();  // TP1/TP2 exit bar (bright cyan)
+let slExitUnix   = new Set();  // SL/BE exit bar (hot red)
 
 const IN_POS = new Set(['LONG','LONG_BE','SHORT','SHORT_BE']);
 const BE_SET  = new Set(['LONG_BE','SHORT_BE']);
@@ -492,6 +500,24 @@ function loadData(data) {
     if (t._exitUnix) {
       (exitMap[t._exitUnix] = exitMap[t._exitUnix] || []).push(i);
     }
+  });
+
+  // Build special candle sets
+  pendingUnix.clear(); signalUnix.clear(); entryFillUnix.clear();
+  tpExitUnix.clear();  slExitUnix.clear();
+  trades.forEach(t => {
+    if (t._entryUnix) entryFillUnix.add(t._entryUnix);
+    if (t._exitUnix) {
+      const xt = t.exit_type || '';
+      if (xt === 'tp1' || xt === 'tp2') tpExitUnix.add(t._exitUnix);
+      else slExitUnix.add(t._exitUnix);
+    }
+  });
+  allBars.forEach(b => {
+    const st  = b.meta?.state || '';
+    const sig = b.signal || '';
+    if (st === 'ENTRY_PENDING') pendingUnix.add(tsUnix(b.ts));
+    if (sig === 'BUY' || sig === 'SELL') signalUnix.add(tsUnix(b.ts));
   });
 
   // Show strategy params in title
@@ -711,8 +737,35 @@ function applyBar(idx, animate) {
   const inPos = IN_POS.has(state);
   const isBE  = BE_SET.has(state);
 
-  // Candle
+  // Candle (with optional special highlights)
   const candle = { time: t, open: bar.o, high: bar.h, low: bar.l, close: bar.c };
+  if (showHighlights) {
+    // Priority: sl > tp > entry-fill > signal-trigger > pending (last applied wins)
+    if (pendingUnix.has(t)) {
+      // Setup bars: amber wick+border, body stays normal
+      candle.borderColor = '#8a6400'; candle.wickColor = '#8a6400';
+    }
+    if (signalUnix.has(t)) {
+      // Entry trigger bar (signal generated): bright orange full candle
+      candle.color = bar.c >= bar.o ? '#3d2800' : '#3d1800';
+      candle.borderColor = '#f5a623'; candle.wickColor = '#f5a623';
+    }
+    if (entryFillUnix.has(t)) {
+      // Order fill bar (where entry_price comes from): blue tint
+      candle.color = bar.c >= bar.o ? '#0d1f3c' : '#1a0d3c';
+      candle.borderColor = '#4d8fff'; candle.wickColor = '#4d8fff';
+    }
+    if (tpExitUnix.has(t)) {
+      // TP exit bar: bright cyan/green
+      candle.color = bar.c >= bar.o ? '#003319' : '#001a0d';
+      candle.borderColor = '#00e676'; candle.wickColor = '#00e676';
+    }
+    if (slExitUnix.has(t)) {
+      // SL/BE exit bar: hot red
+      candle.color = bar.c >= bar.o ? '#4a0000' : '#3a0000';
+      candle.borderColor = '#ff2222'; candle.wickColor = '#ff2222';
+    }
+  }
   candleArr.push(candle);
   if (animate) candleSeries.update(candle);
 
@@ -1021,6 +1074,12 @@ document.getElementById('btn-show-entry').addEventListener('click', () => {
   showEntry = !showEntry;
   document.getElementById('btn-show-entry').classList.toggle('active', showEntry);
   entrySeries.applyOptions({ visible: showEntry });
+});
+document.getElementById('btn-show-hl').addEventListener('click', () => {
+  showHighlights = !showHighlights;
+  document.getElementById('btn-show-hl').classList.toggle('active', showHighlights);
+  // Rebuild candle data with/without highlights
+  seekTo(currentIdx, false);
 });
 
 // Filter

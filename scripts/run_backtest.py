@@ -60,6 +60,7 @@ async def main(args: argparse.Namespace) -> None:
             "trend_ema_period": args.trend_ema_period,
             "trend_slope_bars": args.trend_slope_bars,
             "entry_window": args.entry_window,
+            "entry_cooldown_bars": args.entry_cooldown_bars,
             "max_concurrent_positions": args.max_concurrent,
             # Cali technique filters
             "use_ema_cross_filter": args.use_ema_cross_filter,
@@ -174,6 +175,8 @@ if __name__ == "__main__":
                         help="Bars back to measure trend EMA slope")
     parser.add_argument("--entry-window", type=int, default=2, dest="entry_window",
                         help="Bars to wait for limit fill after EMA confirmation")
+    parser.add_argument("--entry-cooldown-bars", type=int, default=5, dest="entry_cooldown_bars",
+                        help="Min bars between consecutive entry signals (default: 5)")
     parser.add_argument("--max-concurrent", type=int, default=1, dest="max_concurrent",
                         help="Max simultaneous open positions (1 = classic single-trade mode)")
     parser.add_argument("--htf-timeframe", default="1h", dest="htf_timeframe",

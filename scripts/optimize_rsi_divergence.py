@@ -76,6 +76,7 @@ FIXED_PARAMS = {
     "tp2_ratio":        1.75,
     "trend_slope_bars": 5,
     "entry_window":     2,
+    "entry_cooldown_bars": 5,
 }
 
 
