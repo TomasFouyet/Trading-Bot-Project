@@ -70,8 +70,9 @@ class Settings(BaseSettings):
     risk_data_delay_threshold_s: int = 60
 
     # ── Costs ───────────────────────────────────────────────
-    commission_bps: Decimal = Decimal("7.5")  # 0.075%
-    slippage_bps: Decimal = Decimal("5.0")    # 0.05%
+    commission_bps: Decimal = Decimal("7.5")        # 0.075%  taker (market orders)
+    maker_commission_bps: Decimal = Decimal("2.0")  # 0.020%  maker (limit orders)
+    slippage_bps: Decimal = Decimal("5.0")          # 0.05%   market slippage
 
     # ── Observability ───────────────────────────────────────
     log_level: str = "INFO"
@@ -89,6 +90,10 @@ class Settings(BaseSettings):
     @property
     def commission_rate(self) -> Decimal:
         return self.commission_bps / Decimal("10000")
+
+    @property
+    def maker_commission_rate(self) -> Decimal:
+        return self.maker_commission_bps / Decimal("10000")
 
     @property
     def slippage_rate(self) -> Decimal:

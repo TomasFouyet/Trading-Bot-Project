@@ -1,0 +1,146 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RSI Divergence — Optuna multi-objetivo distribuido
+#
+# Corre N workers en paralelo apuntando al mismo SQLite → Optuna distribuye
+# los trials automáticamente.  El progreso anterior se retoma solo.
+#
+# USO RÁPIDO (4 workers, retoma donde dejaste):
+#   docker compose -f docker-compose.optuna.yml up --build
+#
+# Solo 2 workers (máquinas lentas / poca RAM):
+#   docker compose -f docker-compose.optuna.yml up --build worker-1 worker-2
+#
+# Ver logs en tiempo real:
+#   docker compose -f docker-compose.optuna.yml logs -f
+#
+# Los resultados quedan en ./optimize_results/
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Variables comunes ─────────────────────────────────────────────────────────
+x-worker-base: &worker-base
+  build:
+    context: .
+    dockerfile: Dockerfile.optimizer
+  volumes:
+    # Datos de mercado (solo lectura)
+    - ./data/parquet:/app/data/parquet:ro
+    # Resultados: SQLite compartido + CSV/JSON de salida
+    - ./optimize_results:/results
+  environment:
+    PARQUET_DIR: /app/data/parquet
+    LOG_LEVEL: ERROR
+    LOG_FORMAT: console
+    DATABASE_URL: ""
+    REDIS_URL: ""
+    PYTHONUNBUFFERED: "1"
+  restart: "no"
+
+# ── Config compartida (editar aquí) ──────────────────────────────────────────
+x-optuna-args: &optuna-args
+  SYMBOL:      "BTC-USDT"
+  TIMEFRAME:   "5m"
+  START_DATE:  "2025-11-20"
+  END_DATE:    "2026-03-06"
+  BALANCE:     "10000"
+  N_TRIALS:    "100"          # trials POR worker (total = N_TRIALS × num_workers)
+  POP_SIZE:    "50"           # NSGA-II population size (mantener igual en todos)
+  STUDY_NAME:  "rsi_nsga2_BTC-USDT_5m"
+  DB_PATH:     "/results/rsi_nsga2_BTC-USDT_5m.db"
+  OUTPUT:      "/results/pareto_results.csv"
+
+services:
+  # ── Worker 1 — arranca primero, inicializa el SQLite ─────────────────────
+  worker-1:
+    <<: *worker-base
+    environment:
+      <<: *optuna-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+      PYTHONUNBUFFERED: "1"
+    command: >
+      python scripts/optimize_optuna.py
+      --symbol     ${SYMBOL:-BTC-USDT}
+      --timeframe  ${TIMEFRAME:-5m}
+      --start      ${START_DATE:-2025-11-20}
+      --end        ${END_DATE:-2026-03-06}
+      --balance    ${BALANCE:-10000}
+      --n-trials   ${N_TRIALS:-100}
+      --population-size ${POP_SIZE:-50}
+      --study-name ${STUDY_NAME:-rsi_nsga2_BTC-USDT_5m}
+      --db-path    ${DB_PATH:-/results/rsi_nsga2_BTC-USDT_5m.db}
+      --output     ${OUTPUT:-/results/pareto_results.csv}
+
+  # ── Worker 2 — espera 15s para que worker-1 inicialice el SQLite ─────────
+  worker-2:
+    <<: *worker-base
+    environment:
+      <<: *optuna-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -c "sleep 15 && python scripts/optimize_optuna.py
+      --symbol     ${SYMBOL:-BTC-USDT}
+      --timeframe  ${TIMEFRAME:-5m}
+      --start      ${START_DATE:-2025-11-20}
+      --end        ${END_DATE:-2026-03-06}
+      --balance    ${BALANCE:-10000}
+      --n-trials   ${N_TRIALS:-100}
+      --population-size ${POP_SIZE:-50}
+      --study-name ${STUDY_NAME:-rsi_nsga2_BTC-USDT_5m}
+      --db-path    ${DB_PATH:-/results/rsi_nsga2_BTC-USDT_5m.db}
+      --output     ${OUTPUT:-/results/pareto_results.csv}"
+
+  # ── Worker 3 — espera 30s ────────────────────────────────────────────────
+  worker-3:
+    <<: *worker-base
+    environment:
+      <<: *optuna-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -c "sleep 30 && python scripts/optimize_optuna.py
+      --symbol     ${SYMBOL:-BTC-USDT}
+      --timeframe  ${TIMEFRAME:-5m}
+      --start      ${START_DATE:-2025-11-20}
+      --end        ${END_DATE:-2026-03-06}
+      --balance    ${BALANCE:-10000}
+      --n-trials   ${N_TRIALS:-100}
+      --population-size ${POP_SIZE:-50}
+      --study-name ${STUDY_NAME:-rsi_nsga2_BTC-USDT_5m}
+      --db-path    ${DB_PATH:-/results/rsi_nsga2_BTC-USDT_5m.db}
+      --output     ${OUTPUT:-/results/pareto_results.csv}"
+
+  # ── Worker 4 — espera 45s ────────────────────────────────────────────────
+  worker-4:
+    <<: *worker-base
+    environment:
+      <<: *optuna-args
+      PARQUET_DIR: /app/data/parquet
+      LOG_LEVEL: ERROR
+      LOG_FORMAT: console
+      DATABASE_URL: ""
+      REDIS_URL: ""
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -c "sleep 45 && python scripts/optimize_optuna.py
+      --symbol     ${SYMBOL:-BTC-USDT}
+      --timeframe  ${TIMEFRAME:-5m}
+      --start      ${START_DATE:-2025-11-20}
+      --end        ${END_DATE:-2026-03-06}
+      --balance    ${BALANCE:-10000}
+      --n-trials   ${N_TRIALS:-100}
+      --population-size ${POP_SIZE:-50}
+      --study-name ${STUDY_NAME:-rsi_nsga2_BTC-USDT_5m}
+      --db-path    ${DB_PATH:-/results/rsi_nsga2_BTC-USDT_5m.db}
+      --output     ${OUTPUT:-/results/pareto_results.csv}"

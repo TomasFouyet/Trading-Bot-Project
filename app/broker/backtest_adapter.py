@@ -47,6 +47,7 @@ class BacktestAdapter(BrokerAdapter):
         bars: list[OHLCVBar],
         initial_balance: Decimal = Decimal("10000"),
         commission_rate: Decimal | None = None,
+        maker_commission_rate: Decimal | None = None,
         slippage_rate: Decimal | None = None,
     ) -> None:
         self._bars = bars
@@ -57,6 +58,7 @@ class BacktestAdapter(BrokerAdapter):
         self._initial_balance = initial_balance
         self._balance = initial_balance
         self._commission = commission_rate or _settings.commission_rate
+        self._maker_commission = maker_commission_rate or _settings.maker_commission_rate
         self._slippage = slippage_rate or _settings.slippage_rate
 
         self._positions: dict[str, Position] = {}
@@ -68,17 +70,37 @@ class BacktestAdapter(BrokerAdapter):
     def advance(self, bar: OHLCVBar) -> list[FillResult]:
         """
         Called by the engine for each new bar.
-        Fills any pending orders at this bar's open price.
+
+        MARKET orders: filled at bar.open + slippage, taker commission.
+        LIMIT orders:
+          - BUY: fill if bar.low <= order.price  → fill at limit price, maker commission.
+          - SELL: fill if bar.high >= order.price → fill at limit price, maker commission.
+          - Unfilled LIMIT orders stay pending (engine cancels stale ones).
         Returns list of fills generated.
         """
         self._current_bar = bar
         new_fills: list[FillResult] = []
-
-        # Fill pending market orders at this bar's open + slippage
         still_pending = []
+
         for order in self._pending_orders:
-            fill_price = self._apply_slippage(bar.open, order.side)
-            fee = fill_price * order.qty * self._commission
+            if order.order_type == OrderType.LIMIT and order.price is not None:
+                # Determine if limit is touched this bar
+                limit_px = order.price
+                touched = (
+                    (order.side == OrderSide.BUY  and bar.low  <= limit_px) or
+                    (order.side == OrderSide.SELL and bar.high >= limit_px)
+                )
+                if not touched:
+                    still_pending.append(order)
+                    continue
+                fill_price = limit_px
+                fee = fill_price * order.qty * self._maker_commission
+                fill_type = "limit"
+            else:
+                # MARKET: fill at bar.open + slippage
+                fill_price = self._apply_slippage(bar.open, order.side)
+                fee = fill_price * order.qty * self._commission
+                fill_type = "market"
 
             fill = FillResult(
                 fill_id=str(uuid.uuid4()),
@@ -102,6 +124,7 @@ class BacktestAdapter(BrokerAdapter):
                 side=order.side.value,
                 qty=str(order.qty),
                 price=str(fill_price),
+                fill_type=fill_type,
                 bar_ts=bar.ts.isoformat(),
             )
 
@@ -276,3 +299,7 @@ class BacktestAdapter(BrokerAdapter):
         self._equity_curve.clear()
         self._bar_index = 0
         self._current_bar = None
+
+    @property
+    def maker_commission_rate(self) -> Decimal:
+        return self._maker_commission

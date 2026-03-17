@@ -235,6 +235,7 @@ code { background: var(--bg3); padding: 2px 6px; border-radius: 3px; font-size: 
   <span class="sep">|</span>
   <span class="hv">RSI: <span id="h-rsi">—</span></span>
   <span class="hv">EMA: <span id="h-ema">—</span></span>
+  <span class="hv">ADX: <span id="h-adx">—</span></span>
   <span class="hv en-v">Entrada: <span id="h-entry">—</span></span>
   <span class="hv sl-v">SL: <span id="h-sl">—</span></span>
   <span class="hv tp-v">TP: <span id="h-tp">—</span></span>
@@ -263,6 +264,10 @@ code { background: var(--bg3); padding: 2px 6px; border-radius: 3px; font-size: 
   <button class="btn active" id="btn-show-tp2">TP2</button>
   <button class="btn active" id="btn-show-entry">Entrada</button>
   <button class="btn active" id="btn-show-hl" title="Resaltar velas de setup, entrada, TP y SL">Marcas</button>
+  <span class="sep">|</span>
+  <button class="btn active" id="btn-show-ema2" title="Segunda EMA (rápida)">EMA2</button>
+  <button class="btn active" id="btn-show-bb" title="Bandas de Bollinger">BB</button>
+  <button class="btn active" id="btn-show-adx" title="ADX en panel RSI">ADX</button>
 </div>
 
 <!-- Progress -->
@@ -390,14 +395,18 @@ const candleSeries = priceChart.addCandlestickSeries({
   borderUpColor: '#3fb950', borderDownColor: '#f85149',
   wickUpColor: '#3fb950', wickDownColor: '#f85149',
 });
-const emaSeries = priceChart.addLineSeries({ color: '#d29922', lineWidth: 1, title: 'EMA', lastValueVisible: true, priceLineVisible: false });
-const slSeries  = priceChart.addLineSeries({ color: '#f85149', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, title: 'SL', lastValueVisible: true, priceLineVisible: false });
-const tp1Series = priceChart.addLineSeries({ color: '#3fb950', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, title: 'TP1', lastValueVisible: true, priceLineVisible: false });
-const tp2Series = priceChart.addLineSeries({ color: '#86efac', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, title: 'TP2', lastValueVisible: true, priceLineVisible: false });
-const entrySeries = priceChart.addLineSeries({ color: '#d29922', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, title: 'E', lastValueVisible: true, priceLineVisible: false });
-const rsiLine   = rsiChart.addLineSeries({ color: '#bc8cff', lineWidth: 1, title: 'RSI', lastValueVisible: true, priceLineVisible: false });
-const rsiOSLine = rsiChart.addLineSeries({ color: '#3fb950', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, lastValueVisible: false, priceLineVisible: false });
-const rsiOBLine = rsiChart.addLineSeries({ color: '#f85149', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, lastValueVisible: false, priceLineVisible: false });
+const emaSeries    = priceChart.addLineSeries({ color: '#d29922', lineWidth: 1, title: 'EMA', lastValueVisible: true, priceLineVisible: false });
+const ema2Series   = priceChart.addLineSeries({ color: '#f5a623', lineWidth: 1, lineStyle: LC.LineStyle.Solid, title: 'EMA2', lastValueVisible: false, priceLineVisible: false });
+const bbUpperSeries= priceChart.addLineSeries({ color: '#2d4a7a', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, title: 'BB+', lastValueVisible: false, priceLineVisible: false });
+const bbLowerSeries= priceChart.addLineSeries({ color: '#2d4a7a', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, title: 'BB-', lastValueVisible: false, priceLineVisible: false });
+const slSeries     = priceChart.addLineSeries({ color: '#f85149', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, title: 'SL', lastValueVisible: true, priceLineVisible: false });
+const tp1Series    = priceChart.addLineSeries({ color: '#3fb950', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, title: 'TP1', lastValueVisible: true, priceLineVisible: false });
+const tp2Series    = priceChart.addLineSeries({ color: '#86efac', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, title: 'TP2', lastValueVisible: true, priceLineVisible: false });
+const entrySeries  = priceChart.addLineSeries({ color: '#d29922', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, title: 'E', lastValueVisible: true, priceLineVisible: false });
+const rsiLine      = rsiChart.addLineSeries({ color: '#bc8cff', lineWidth: 1, title: 'RSI', lastValueVisible: true, priceLineVisible: false });
+const adxLine      = rsiChart.addLineSeries({ color: '#f5a623', lineWidth: 1, title: 'ADX', lastValueVisible: true, priceLineVisible: false });
+const rsiOSLine    = rsiChart.addLineSeries({ color: '#3fb950', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, lastValueVisible: false, priceLineVisible: false });
+const rsiOBLine    = rsiChart.addLineSeries({ color: '#f85149', lineWidth: 1, lineStyle: LC.LineStyle.Dotted, lastValueVisible: false, priceLineVisible: false });
 
 priceChart.subscribeCrosshairMove(p => { if (!p.time) rsiChart.clearCrosshairPosition(); else rsiChart.setCrosshairPosition(0, p.time, rsiLine); });
 rsiChart.subscribeCrosshairMove(p => { if (!p.time) priceChart.clearCrosshairPosition(); else priceChart.setCrosshairPosition(0, p.time, candleSeries); });
@@ -413,6 +422,7 @@ window.addEventListener('load', () => { ro.disconnect(); ro.observe(document.get
 
 // Line visibility
 let showSL = true, showTP = true, showTP2 = true, showEntry = true, showHighlights = true;
+let showEMA2 = true, showBB = true, showADX = true;
 const toggleLine = (series, key) => {
   series.applyOptions({ visible: key });
 };
@@ -424,8 +434,9 @@ let allBars = [], trades = [], equityMap = {}, initBalance = 10000;
 let rsiOversold = 30, rsiOverbought = 70;
 let currentIdx = 0, playing = false, playTimer = null;
 
-let candleArr = [], emaArr = [], rsiArr = [], osArr = [], obArr = [];
+let candleArr = [], emaArr = [], ema2Arr = [], rsiArr = [], osArr = [], obArr = [], adxArr = [];
 let slArr = [], tp1Arr = [], tp2Arr = [], entryArr = [];
+let bbUpperArr = [], bbLowerArr = [];
 let markers = [];
 let processedExits = new Set();
 let wins = 0, losses = 0, closedTrades = 0;
@@ -586,8 +597,7 @@ function renderTradeList() {
         TP1 ${t.tp1_price ? fmtN(t.tp1_price,1) : '—'}
         TP2 ${t.tp2_price ? fmtN(t.tp2_price,1) : '—'}
       </div>`;
-    div.addEventListener('click', () => openTradeDetail(i));
-    div.addEventListener('dblclick', () => jumpToTrade(i));
+    div.addEventListener('click', () => { jumpToTrade(i); openTradeDetail(i); });
     container.appendChild(div);
   });
 }
@@ -684,16 +694,18 @@ function resetPlayback() {
   stopPlay();
   currentIdx = 0;
   markers = [];
-  candleArr = []; emaArr = []; rsiArr = []; osArr = []; obArr = [];
+  candleArr = []; emaArr = []; ema2Arr = []; rsiArr = []; osArr = []; obArr = []; adxArr = [];
   slArr = []; tp1Arr = []; tp2Arr = []; entryArr = [];
+  bbUpperArr = []; bbLowerArr = [];
   processedExits = new Set();
   wins = 0; losses = 0; closedTrades = 0;
   activeTrade = null; maxEquity = initBalance;
 
   document.querySelectorAll('.trade-card').forEach(el => el.classList.remove('won','lost','active-card'));
 
-  [candleSeries, emaSeries, slSeries, tp1Series, tp2Series, entrySeries,
-   rsiLine, rsiOSLine, rsiOBLine].forEach(s => s.setData([]));
+  [candleSeries, emaSeries, ema2Series, bbUpperSeries, bbLowerSeries,
+   slSeries, tp1Series, tp2Series, entrySeries,
+   rsiLine, adxLine, rsiOSLine, rsiOBLine].forEach(s => s.setData([]));
   candleSeries.setMarkers([]);
 
   updateStats(initBalance);
@@ -769,11 +781,27 @@ function applyBar(idx, animate) {
   candleArr.push(candle);
   if (animate) candleSeries.update(candle);
 
-  // EMA
-  if (meta.ema != null) {
-    const ep = { time: t, value: +meta.ema };
+  // EMA slow (or single EMA)
+  const emav = meta.ema_slow != null ? +meta.ema_slow : (meta.ema != null ? +meta.ema : null);
+  if (emav != null) {
+    const ep = { time: t, value: emav };
     emaArr.push(ep);
     if (animate) emaSeries.update(ep);
+  }
+
+  // EMA fast (second line)
+  if (meta.ema_fast != null && showEMA2) {
+    const ep2 = { time: t, value: +meta.ema_fast };
+    ema2Arr.push(ep2);
+    if (animate) ema2Series.update(ep2);
+  }
+
+  // Bollinger Bands
+  if (meta.bb_upper != null && meta.bb_lower != null && showBB) {
+    const bu = { time: t, value: +meta.bb_upper };
+    const bl = { time: t, value: +meta.bb_lower };
+    bbUpperArr.push(bu); bbLowerArr.push(bl);
+    if (animate) { bbUpperSeries.update(bu); bbLowerSeries.update(bl); }
   }
 
   // RSI
@@ -787,6 +815,13 @@ function applyBar(idx, animate) {
       rsiOSLine.update({ time: t, value: rsiOversold });
       rsiOBLine.update({ time: t, value: rsiOverbought });
     }
+  }
+
+  // ADX (in RSI chart, same 0-100 scale)
+  if (meta.adx != null && showADX) {
+    const ap = { time: t, value: +meta.adx };
+    adxArr.push(ap);
+    if (animate) adxLine.update(ap);
   }
 
   // Entry markers
@@ -882,16 +917,20 @@ function seekTo(targetIdx, autoScroll = true) {
   for (let i = 0; i < limit; i++) applyBar(i, false);
 
   // Batch set series
-  if (candleArr.length)  candleSeries.setData(candleArr);
-  if (emaArr.length)     emaSeries.setData(emaArr);
-  if (rsiArr.length)     rsiLine.setData(rsiArr);
-  if (osArr.length)      rsiOSLine.setData(osArr);
-  if (obArr.length)      rsiOBLine.setData(obArr);
-  if (slArr.length  && showSL)    slSeries.setData(slArr);
-  if (tp1Arr.length && showTP)    tp1Series.setData(tp1Arr);
-  if (tp2Arr.length && showTP2)   tp2Series.setData(tp2Arr);
-  if (entryArr.length && showEntry) entrySeries.setData(entryArr);
-  if (markers.length)    candleSeries.setMarkers([...markers].sort((a,b) => a.time-b.time));
+  if (candleArr.length)    candleSeries.setData(candleArr);
+  if (emaArr.length)       emaSeries.setData(emaArr);
+  if (ema2Arr.length && showEMA2)       ema2Series.setData(ema2Arr);
+  if (bbUpperArr.length && showBB)      bbUpperSeries.setData(bbUpperArr);
+  if (bbLowerArr.length && showBB)      bbLowerSeries.setData(bbLowerArr);
+  if (rsiArr.length)       rsiLine.setData(rsiArr);
+  if (adxArr.length && showADX)         adxLine.setData(adxArr);
+  if (osArr.length)        rsiOSLine.setData(osArr);
+  if (obArr.length)        rsiOBLine.setData(obArr);
+  if (slArr.length  && showSL)          slSeries.setData(slArr);
+  if (tp1Arr.length && showTP)          tp1Series.setData(tp1Arr);
+  if (tp2Arr.length && showTP2)         tp2Series.setData(tp2Arr);
+  if (entryArr.length && showEntry)     entrySeries.setData(entryArr);
+  if (markers.length)      candleSeries.setMarkers([...markers].sort((a,b) => a.time-b.time));
 
   processedExits.forEach(ti => {
     const tr  = trades[ti];
@@ -944,7 +983,9 @@ function updateHeader(state, meta, curClose) {
   badge.className = 'state-badge ' + (STATE_MAP[state] || 's-flat');
   if (meta) {
     document.getElementById('h-rsi').textContent   = meta.rsi  != null ? (+meta.rsi).toFixed(1)  : '—';
-    document.getElementById('h-ema').textContent   = meta.ema  != null ? (+meta.ema).toFixed(2)  : '—';
+    const emaDisplay = meta.ema_slow ?? meta.ema;
+    document.getElementById('h-ema').textContent   = emaDisplay != null ? (+emaDisplay).toFixed(2) : '—';
+    document.getElementById('h-adx').textContent   = meta.adx  != null ? (+meta.adx).toFixed(1)  : '—';
     document.getElementById('h-sl').textContent    = meta.sl   != null ? (+meta.sl).toFixed(2)   : '—';
     document.getElementById('h-tp').textContent    = meta.tp   != null ? (+meta.tp).toFixed(2)   : '—';
     document.getElementById('h-entry').textContent = activeTrade?.entry != null
@@ -1093,6 +1134,24 @@ function setFilter(f) {
 document.getElementById('f-all').addEventListener('click', () => setFilter('all'));
 document.getElementById('f-win').addEventListener('click', () => setFilter('win'));
 document.getElementById('f-loss').addEventListener('click', () => setFilter('loss'));
+
+// New indicator toggles
+document.getElementById('btn-show-ema2').addEventListener('click', () => {
+  showEMA2 = !showEMA2;
+  document.getElementById('btn-show-ema2').classList.toggle('active', showEMA2);
+  ema2Series.applyOptions({ visible: showEMA2 });
+});
+document.getElementById('btn-show-bb').addEventListener('click', () => {
+  showBB = !showBB;
+  document.getElementById('btn-show-bb').classList.toggle('active', showBB);
+  bbUpperSeries.applyOptions({ visible: showBB });
+  bbLowerSeries.applyOptions({ visible: showBB });
+});
+document.getElementById('btn-show-adx').addEventListener('click', () => {
+  showADX = !showADX;
+  document.getElementById('btn-show-adx').classList.toggle('active', showADX);
+  adxLine.applyOptions({ visible: showADX });
+});
 </script>
 </body>
 </html>

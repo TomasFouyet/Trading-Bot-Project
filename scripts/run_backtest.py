@@ -81,6 +81,34 @@ async def main(args: argparse.Namespace) -> None:
             "session_end_utc": args.session_end_utc,
             "bars_per_day": args.bars_per_day,
         }
+    elif args.strategy == "mean_reversion":
+        strategy_params = {
+            "rsi_oversold":  args.rsi_oversold,
+            "rsi_overbought": args.rsi_overbought,
+            "adx_max":       args.adx_max,
+            "min_rr":        args.min_rr,
+            "allow_short":   args.allow_short,
+            "swing_lookback": args.swing_lookback,
+        }
+    elif args.strategy == "trend_following":
+        strategy_params = {
+            "adx_min":               args.adx_min,
+            "min_rr":                args.min_rr,
+            "pullback_tolerance_atr": args.pullback_tolerance_atr,
+            "allow_short":           args.allow_short,
+            "ema_fast":              args.ema_fast_tf,
+            "ema_slow":              args.ema_slow_tf,
+            "slope_bars":            args.slope_bars,
+        }
+    elif args.strategy == "event_driven":
+        strategy_params = {
+            "vol_multiplier": args.vol_multiplier,
+            "lookback":       args.event_lookback,
+            "min_rr":         args.min_rr,
+            "max_hold_bars":  args.max_hold_bars,
+            "allow_short":    args.allow_short,
+            "tp_rr":          args.tp_rr,
+        }
     else:
         strategy_params = {}
 
@@ -142,7 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("--end", default="2026-03-06")
     parser.add_argument("--balance", type=float, default=10000.0)
     parser.add_argument("--strategy", default="ema_cross",
-                        choices=["ema_cross", "rsi_divergence", "hybrid_rsi_pivot"],
+                        choices=["ema_cross", "rsi_divergence", "hybrid_rsi_pivot",
+                                 "mean_reversion", "trend_following", "event_driven"],
                         help="Strategy to backtest")
     parser.add_argument("--commission-bps", type=float, default=7.5, dest="commission_bps")
     parser.add_argument("--slippage-bps", type=float, default=5.0, dest="slippage_bps")
@@ -213,6 +242,35 @@ if __name__ == "__main__":
     parser.add_argument("--session-end-utc", type=int, default=21, dest="session_end_utc")
     parser.add_argument("--bars-per-day", type=int, default=288, dest="bars_per_day",
                         help="Bars per calendar day: 288 for 5m, 96 for 15m, 24 for 1h")
+
+    # ── Mean Reversion params ──────────────────────────────────────────────────
+    parser.add_argument("--adx-max", type=float, default=25.0, dest="adx_max",
+                        help="ADX máximo para mean reversion (encima = tendencia, no operar)")
+    parser.add_argument("--min-rr", type=float, default=1.5, dest="min_rr",
+                        help="R:R mínimo para mean_reversion / trend_following / event_driven")
+
+    # ── Trend Following params ─────────────────────────────────────────────────
+    parser.add_argument("--adx-min", type=float, default=25.0, dest="adx_min",
+                        help="ADX mínimo para trend following (tendencia activa)")
+    parser.add_argument("--pullback-tolerance-atr", type=float, default=1.5,
+                        dest="pullback_tolerance_atr",
+                        help="Tolerancia del pullback a EMA rápida en ATRs")
+    parser.add_argument("--ema-fast-tf", type=int, default=20, dest="ema_fast_tf",
+                        help="EMA rápida para trend following (proxy pullback 4H)")
+    parser.add_argument("--ema-slow-tf", type=int, default=50, dest="ema_slow_tf",
+                        help="EMA lenta para trend following (proxy trend diario)")
+    parser.add_argument("--slope-bars", type=int, default=5, dest="slope_bars",
+                        help="Barras para medir pendiente de EMA lenta")
+
+    # ── Event Driven params ────────────────────────────────────────────────────
+    parser.add_argument("--vol-multiplier", type=float, default=2.0, dest="vol_multiplier",
+                        help="Múltiplo de volumen para detectar el evento")
+    parser.add_argument("--event-lookback", type=int, default=20, dest="event_lookback",
+                        help="Barras para definir el rango y vol promedio (event_driven)")
+    parser.add_argument("--max-hold-bars", type=int, default=20, dest="max_hold_bars",
+                        help="Barras máximas sin confirmación antes de cierre por tiempo")
+    parser.add_argument("--tp-rr", type=float, default=2.5, dest="tp_rr",
+                        help="Target en múltiplos de R para event_driven")
 
     args = parser.parse_args()
     asyncio.run(main(args))

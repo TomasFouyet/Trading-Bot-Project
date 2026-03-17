@@ -127,15 +127,22 @@ class BacktestEngine:
         store: ParquetStore,
         initial_balance: Decimal = Decimal("10000"),
         commission_rate: Decimal | None = None,
+        maker_commission_rate: Decimal | None = None,
         slippage_rate: Decimal | None = None,
         verbose: bool = False,
+        max_daily_drawdown_pct: Decimal | None = None,
+        use_limit_orders: bool = True,
+        limit_order_max_bars: int = 2,
     ) -> None:
         self._strategy = strategy
         self._store = store
         self._initial_balance = initial_balance
         self._commission = commission_rate or _settings.commission_rate
+        self._maker_commission = maker_commission_rate or _settings.maker_commission_rate
         self._slippage = slippage_rate or _settings.slippage_rate
-        self._risk = RiskManager()
+        self._use_limit_orders = use_limit_orders
+        self._limit_order_max_bars = limit_order_max_bars
+        self._risk = RiskManager(max_daily_drawdown_pct=max_daily_drawdown_pct)
         self._verbose = verbose
 
     async def run(
@@ -188,6 +195,7 @@ class BacktestEngine:
             bars=bars,
             initial_balance=self._initial_balance,
             commission_rate=self._commission,
+            maker_commission_rate=self._maker_commission,
             slippage_rate=self._slippage,
         )
         self._risk.initialize(self._initial_balance, as_of_date=bars[0].ts.date())
@@ -206,6 +214,8 @@ class BacktestEngine:
         pending_entries: dict[str, dict] = {}
         # pending_closes: order_id → {position_id, close_pct}  (close_pct=1.0 = full)
         pending_closes: dict[str, dict] = {}
+        # limit_entry_ages: order_id → bars_pending (for expiry of unfilled limit entries)
+        limit_entry_ages: dict[str, int] = {}
 
         bars_in_position = 0
         total_bars = len(bars)
@@ -215,10 +225,12 @@ class BacktestEngine:
             # 1. Advance adapter (fills pending orders at this bar's open)
             fills = adapter.advance(bar)
 
+            _newly_opened_pids: set = set()
             for fill in fills:
                 # ── Entry fill ─────────────────────────────────────────────
                 if fill.order_id in pending_entries:
                     pe = pending_entries.pop(fill.order_id)
+                    limit_entry_ages.pop(fill.order_id, None)  # filled — stop tracking age
                     pid = pe["position_id"]
                     sig = pe["signal"]
                     side_str = "LONG" if sig.action == SignalAction.BUY else "SHORT"
@@ -232,8 +244,6 @@ class BacktestEngine:
                         "qty": fill.qty,
                         "original_qty": fill.qty,
                         "fee_in": fill.fee,
-                        "total_partial_pnl": Decimal("0"),
-                        "total_partial_fees": Decimal("0"),
                         "mode": "backtest",
                         # SL / TP from entry signal
                         "sl_price": float(sig.stop_loss) if sig.stop_loss else None,
@@ -241,25 +251,27 @@ class BacktestEngine:
                         "tp2_price": sig.meta.get("tp2"),
                         "entry_rsi": sig.meta.get("rsi"),
                         "entry_ema": sig.meta.get("ema"),
+                        "tp1_hit": False,
                     }
+                    _newly_opened_pids.add(pid)
                     logger.debug("backtest_entry", side=side_str, price=str(fill.price),
                                  ts=fill.timestamp.isoformat())
 
-                # ── Partial close fill ─────────────────────────────────────
+                # ── Partial / full close fill ──────────────────────────────
                 elif fill.order_id in pending_closes:
                     pc = pending_closes.pop(fill.order_id)
                     pid = pc["position_id"]
-                    close_pct = pc["close_pct"]
                     exit_type = pc.get("exit_type", "tp1")
 
                     if pid in open_trades:
                         trade = open_trades[pid]
                         # Use the strategy-provided limit price (TP/SL level) when available,
                         # so PnL reflects the actual trigger level rather than next-bar open.
+                        # Limit exits (SL/TP pre-placed orders) use maker fee rate.
                         intended_price = pc.get("limit_price")
                         if intended_price is not None:
                             exit_price = Decimal(str(intended_price))
-                            fee_out = exit_price * fill.qty * self._commission
+                            fee_out = exit_price * fill.qty * self._maker_commission
                         else:
                             exit_price = fill.price
                             fee_out = fill.fee
@@ -275,17 +287,124 @@ class BacktestEngine:
                         fee_in_part = trade["fee_in"] * pct_of_orig
                         net_pnl = gross_pnl - fee_in_part - fee_out
 
-                        trade["total_partial_pnl"] += net_pnl
-                        trade["total_partial_fees"] += fee_in_part + fee_out
                         trade["qty"] -= closed_qty
 
+                        # Record this leg immediately — each TP1/TP2/SL exit is
+                        # its own trade entry for full transparency.
+                        self._record_trade_leg(
+                            result, trade, exit_price, fill.timestamp,
+                            leg_qty=closed_qty,
+                            leg_pnl=net_pnl,
+                            leg_fees=fee_in_part + fee_out,
+                            exit_type=exit_type,
+                        )
+
                         if trade["qty"] < Decimal("0.0001"):
-                            self._record_trade(result, trade, exit_price, fill.timestamp,
-                                               fee_out, exit_type=exit_type, is_final_partial=True)
                             del open_trades[pid]
+
+            # ── Expire stale limit entry orders ────────────────────────────
+            # Limit entries that haven't filled within limit_order_max_bars are
+            # cancelled so the strategy can re-evaluate on fresh signal.
+            if self._use_limit_orders:
+                stale_oids = []
+                for oid in list(limit_entry_ages.keys()):
+                    if oid in pending_entries:  # still unfilled
+                        limit_entry_ages[oid] += 1
+                        if limit_entry_ages[oid] >= self._limit_order_max_bars:
+                            stale_oids.append(oid)
+                for oid in stale_oids:
+                    limit_entry_ages.pop(oid, None)
+                    pe = pending_entries.pop(oid, None)
+                    await adapter.cancel_order(oid, symbol)
+                    if pe:
+                        logger.debug("limit_entry_expired", order_id=oid,
+                                     pid=pe.get("position_id"), bar_ts=bar.ts.isoformat())
 
             # Count bars in position
             bars_in_position += len(open_trades)
+
+            # ── Automated SL/TP check ──────────────────────────────────────
+            # Only runs for strategies where engine_manages_sl_tp = True.
+            # Strategies that emit their own CLOSE/PARTIAL_CLOSE (e.g.
+            # rsi_divergence) set engine_manages_sl_tp = False to avoid
+            # double-closing.
+            _tp1_close_pct = float(self._strategy.params.get("tp1_close_pct", 0.70))
+            _pending_pids   = {v.get("position_id") for v in pending_closes.values()}
+            _engine_sl_tp   = getattr(self._strategy, "engine_manages_sl_tp", True)
+
+            for _pid in list(open_trades.keys()) if _engine_sl_tp else []:
+                # Skip trades with a pending close already queued
+                if _pid in _pending_pids:
+                    continue
+                # Skip trades that were just opened this bar (avoid same-bar trigger)
+                if _pid in _newly_opened_pids:
+                    continue
+
+                _tr     = open_trades[_pid]
+                _sl     = _tr.get("sl_price")
+                _tp1    = _tr.get("tp1_price")
+                _tp2    = _tr.get("tp2_price")
+                _is_lng = _tr["side"] == "LONG"
+                _bh     = float(bar.high)
+                _bl     = float(bar.low)
+
+                _exit_px   = None
+                _exit_type = None
+                _cls_pct   = 1.0  # default: full close
+
+                if _is_lng:
+                    if _sl is not None and _bl <= _sl:
+                        # Stop-loss hit
+                        _exit_px   = _sl
+                        _exit_type = "be_sl" if _tr.get("tp1_hit") else "sl"
+                    elif _tp2 is not None and _bh >= _tp2 and _tr.get("tp1_hit"):
+                        # TP2 hit (remaining qty)
+                        _exit_px   = _tp2
+                        _exit_type = "tp2"
+                    elif _tp1 is not None and _bh >= _tp1 and not _tr.get("tp1_hit"):
+                        # TP1 hit (first time)
+                        _exit_px   = _tp1
+                        _exit_type = "tp1"
+                        _cls_pct   = _tp1_close_pct if _tp2 is not None else 1.0
+                else:  # SHORT
+                    if _sl is not None and _bh >= _sl:
+                        _exit_px   = _sl
+                        _exit_type = "be_sl" if _tr.get("tp1_hit") else "sl"
+                    elif _tp2 is not None and _bl <= _tp2 and _tr.get("tp1_hit"):
+                        _exit_px   = _tp2
+                        _exit_type = "tp2"
+                    elif _tp1 is not None and _bl <= _tp1 and not _tr.get("tp1_hit"):
+                        _exit_px   = _tp1
+                        _exit_type = "tp1"
+                        _cls_pct   = _tp1_close_pct if _tp2 is not None else 1.0
+
+                if _exit_px is not None:
+                    _cls_qty = (_tr["qty"] * Decimal(str(_cls_pct))).quantize(Decimal("0.000001"))
+                    _cls_qty = min(_cls_qty, _tr["qty"])
+                    if _cls_qty > Decimal("0"):
+                        _req = OrderRequest(
+                            symbol=symbol,
+                            side=OrderSide.SELL if _is_lng else OrderSide.BUY,
+                            order_type=OrderType.MARKET,
+                            qty=_cls_qty,
+                            strategy_id=self._strategy.strategy_id,
+                        )
+                        _ord, _ = await adapter.place_order(_req)
+                        pending_closes[_ord.order_id] = {
+                            "position_id": _pid,
+                            "close_pct":   _cls_pct,
+                            "exit_type":   _exit_type,
+                            "limit_price": _exit_px,
+                        }
+                        if _exit_type == "tp1":
+                            # Mark TP1 as hit and move SL to breakeven
+                            _tr["tp1_hit"]  = True
+                            _tr["sl_price"] = float(_tr["entry_price"])
+                        logger.debug(
+                            "sl_tp_triggered",
+                            pid=_pid, exit_type=_exit_type,
+                            exit_px=_exit_px, bar_ts=bar.ts.isoformat(),
+                        )
 
             # 2. Build strategy window
             window_start = max(0, i + 1 - WINDOW_SIZE)
@@ -324,6 +443,25 @@ class BacktestEngine:
                 for sig in signals:
                     merged_meta.update(sig.meta)
                 primary_sig = signals[0] if signals else None
+
+                # Add position state from open_trades so viewer can draw SL/TP on every bar
+                if open_trades:
+                    _first = next(iter(open_trades.values()))
+                    _pos_state = _first["side"]  # "LONG" or "SHORT"
+                    _pos_sl    = _first.get("sl_price")
+                    _pos_tp1   = _first.get("tp1_price")
+                    _pos_tp2   = _first.get("tp2_price")
+                    _pos_entry = float(_first["entry_price"]) if _first.get("entry_price") else None
+                else:
+                    _pos_state = "FLAT"
+                    _pos_sl = _pos_tp1 = _pos_tp2 = _pos_entry = None
+
+                position_meta: dict = {"state": _pos_state}
+                if _pos_sl    is not None: position_meta["sl"]    = _pos_sl
+                if _pos_tp1   is not None: position_meta["tp"]    = _pos_tp1
+                if _pos_tp2   is not None: position_meta["tp2"]   = _pos_tp2
+                if _pos_entry is not None: position_meta["entry"] = _pos_entry
+
                 result.bar_data.append({
                     "ts": bar.ts.isoformat(),
                     "o": float(bar.open), "h": float(bar.high),
@@ -331,7 +469,7 @@ class BacktestEngine:
                     "v": float(bar.volume),
                     "signal": primary_sig.action.value if primary_sig else "HOLD",
                     "reason": primary_sig.reason if primary_sig else "",
-                    "meta": merged_meta,
+                    "meta": {**merged_meta, **position_meta},  # position_meta overrides to ensure accuracy
                 })
 
             # 4. Risk + equity
@@ -377,31 +515,59 @@ class BacktestEngine:
                     # Don't double-open same position
                     if pid and pid in open_trades:
                         continue
+                    # Enforce max concurrent positions (default 1 to prevent capital overuse)
+                    max_concurrent = int(self._strategy.params.get("max_concurrent_positions", 1))
+                    if len(open_trades) >= max_concurrent:
+                        continue
                     qty = self._risk.compute_order_qty(sig, equity, bar.close)
-                    req = OrderRequest(
-                        symbol=symbol, side=OrderSide.BUY,
-                        order_type=OrderType.MARKET, qty=qty,
-                        strategy_id=self._strategy.strategy_id,
-                    )
+                    _entry_px = sig.meta.get("limit_price")  # strategy can override
+                    if self._use_limit_orders:
+                        _limit_px = Decimal(str(_entry_px)) if _entry_px else bar.close
+                        req = OrderRequest(
+                            symbol=symbol, side=OrderSide.BUY,
+                            order_type=OrderType.LIMIT, qty=qty,
+                            price=_limit_px,
+                            strategy_id=self._strategy.strategy_id,
+                        )
+                    else:
+                        req = OrderRequest(
+                            symbol=symbol, side=OrderSide.BUY,
+                            order_type=OrderType.MARKET, qty=qty,
+                            strategy_id=self._strategy.strategy_id,
+                        )
                     order, _ = await adapter.place_order(req)
-                    pending_entries[order.order_id] = {
-                        "position_id": pid or str(uuid.uuid4()),
-                        "signal": sig,
-                    }
+                    _new_pid = pid or str(uuid.uuid4())
+                    pending_entries[order.order_id] = {"position_id": _new_pid, "signal": sig}
+                    if self._use_limit_orders:
+                        limit_entry_ages[order.order_id] = 0
 
                 # ── Open SHORT ─────────────────────────────────────────────
                 elif sig.action == SignalAction.SELL and not (pid and pid in open_trades):
+                    # Enforce max concurrent positions (default 1 to prevent capital overuse)
+                    max_concurrent = int(self._strategy.params.get("max_concurrent_positions", 1))
+                    if len(open_trades) >= max_concurrent:
+                        continue
                     qty = self._risk.compute_order_qty(sig, equity, bar.close)
-                    req = OrderRequest(
-                        symbol=symbol, side=OrderSide.SELL,
-                        order_type=OrderType.MARKET, qty=qty,
-                        strategy_id=self._strategy.strategy_id,
-                    )
+                    _entry_px = sig.meta.get("limit_price")  # strategy can override
+                    if self._use_limit_orders:
+                        _limit_px = Decimal(str(_entry_px)) if _entry_px else bar.close
+                        req = OrderRequest(
+                            symbol=symbol, side=OrderSide.SELL,
+                            order_type=OrderType.LIMIT, qty=qty,
+                            price=_limit_px,
+                            strategy_id=self._strategy.strategy_id,
+                        )
+                    else:
+                        req = OrderRequest(
+                            symbol=symbol, side=OrderSide.SELL,
+                            order_type=OrderType.MARKET, qty=qty,
+                            strategy_id=self._strategy.strategy_id,
+                        )
                     order, _ = await adapter.place_order(req)
-                    pending_entries[order.order_id] = {
-                        "position_id": pid or str(uuid.uuid4()),
-                        "signal": sig,
-                    }
+                    _new_pid = pid or str(uuid.uuid4())
+                    pending_entries[order.order_id] = {"position_id": _new_pid, "signal": sig}
+                    if self._use_limit_orders:
+                        limit_entry_ages[order.order_id] = 0
 
                 # ── Partial close ──────────────────────────────────────────
                 elif sig.action == SignalAction.PARTIAL_CLOSE:
@@ -418,18 +584,28 @@ class BacktestEngine:
                         close_qty = min(close_qty, target_trade["qty"])
                         if close_qty > Decimal("0"):
                             is_long = target_trade["side"] == "LONG"
-                            req = OrderRequest(
-                                symbol=symbol,
-                                side=OrderSide.SELL if is_long else OrderSide.BUY,
-                                order_type=OrderType.MARKET, qty=close_qty,
-                                strategy_id=self._strategy.strategy_id,
-                            )
-                            order, _ = await adapter.place_order(req)
+                            _exit_px = sig.meta.get("exit_price")
+                            if self._use_limit_orders and _exit_px is not None:
+                                _close_req = OrderRequest(
+                                    symbol=symbol,
+                                    side=OrderSide.SELL if is_long else OrderSide.BUY,
+                                    order_type=OrderType.LIMIT, qty=close_qty,
+                                    price=Decimal(str(_exit_px)),
+                                    strategy_id=self._strategy.strategy_id,
+                                )
+                            else:
+                                _close_req = OrderRequest(
+                                    symbol=symbol,
+                                    side=OrderSide.SELL if is_long else OrderSide.BUY,
+                                    order_type=OrderType.MARKET, qty=close_qty,
+                                    strategy_id=self._strategy.strategy_id,
+                                )
+                            order, _ = await adapter.place_order(_close_req)
                             pending_closes[order.order_id] = {
                                 "position_id": target_trade["position_id"],
                                 "close_pct": close_pct,
                                 "exit_type": sig.meta.get("exit_type", "tp1"),
-                                "limit_price": sig.meta.get("exit_price"),
+                                "limit_price": _exit_px,
                             }
 
                 # ── Full close ─────────────────────────────────────────────
@@ -443,18 +619,28 @@ class BacktestEngine:
                     if target_trade:
                         qty = target_trade["qty"]
                         is_long = target_trade["side"] == "LONG"
-                        req = OrderRequest(
-                            symbol=symbol,
-                            side=OrderSide.SELL if is_long else OrderSide.BUY,
-                            order_type=OrderType.MARKET, qty=qty,
-                            strategy_id=self._strategy.strategy_id,
-                        )
-                        order, _ = await adapter.place_order(req)
+                        _exit_px = sig.meta.get("exit_price")
+                        if self._use_limit_orders and _exit_px is not None:
+                            _close_req = OrderRequest(
+                                symbol=symbol,
+                                side=OrderSide.SELL if is_long else OrderSide.BUY,
+                                order_type=OrderType.LIMIT, qty=qty,
+                                price=Decimal(str(_exit_px)),
+                                strategy_id=self._strategy.strategy_id,
+                            )
+                        else:
+                            _close_req = OrderRequest(
+                                symbol=symbol,
+                                side=OrderSide.SELL if is_long else OrderSide.BUY,
+                                order_type=OrderType.MARKET, qty=qty,
+                                strategy_id=self._strategy.strategy_id,
+                            )
+                        order, _ = await adapter.place_order(_close_req)
                         pending_closes[order.order_id] = {
                             "position_id": target_trade["position_id"],
                             "close_pct": 1.0,
                             "exit_type": sig.meta.get("exit_type", "close"),
-                            "limit_price": sig.meta.get("exit_price"),
+                            "limit_price": _exit_px,
                         }
 
             # Handle fills queued by the close orders placed above
@@ -492,14 +678,13 @@ class BacktestEngine:
                             "qty": fill.qty,
                             "original_qty": fill.qty,
                             "fee_in": fill.fee,
-                            "total_partial_pnl": Decimal("0"),
-                            "total_partial_fees": Decimal("0"),
                             "mode": "backtest",
                             "sl_price": float(sig.stop_loss) if sig.stop_loss else None,
                             "tp1_price": float(sig.take_profit) if sig.take_profit else None,
                             "tp2_price": sig.meta.get("tp2"),
                             "entry_rsi": sig.meta.get("rsi"),
                             "entry_ema": sig.meta.get("ema"),
+                            "tp1_hit": False,
                         }
                     elif fill.order_id in pending_closes:
                         pc = pending_closes.pop(fill.order_id)
@@ -521,13 +706,14 @@ class BacktestEngine:
                             pct_of_orig = closed_qty / trade["original_qty"]
                             fee_in_part = trade["fee_in"] * pct_of_orig
                             net_pnl = gross_pnl - fee_in_part - fee_out
-                            trade["total_partial_pnl"] += net_pnl
-                            trade["total_partial_fees"] += fee_in_part + fee_out
                             trade["qty"] -= closed_qty
+                            self._record_trade_leg(
+                                result, trade, exit_price, fill.timestamp,
+                                leg_qty=closed_qty, leg_pnl=net_pnl,
+                                leg_fees=fee_in_part + fee_out,
+                                exit_type=pc.get("exit_type", "close"),
+                            )
                             if trade["qty"] < Decimal("0.0001"):
-                                self._record_trade(result, trade, exit_price, fill.timestamp,
-                                                   fee_out, exit_type=pc.get("exit_type", "close"),
-                                                   is_final_partial=True)
                                 del open_trades[pid]
 
         # ── Force-close remaining open positions at end ───────────────────
@@ -543,59 +729,40 @@ class BacktestEngine:
                 remaining_pct = qty / trade["original_qty"]
                 fee_in_portion = trade["fee_in"] * remaining_pct
                 fee_out = exit_price * qty * self._commission
-                net_pnl_this_leg = gross_pnl - fee_in_portion - fee_out
-                total_net_pnl = trade["total_partial_pnl"] + net_pnl_this_leg
-                total_fees = trade["total_partial_fees"] + fee_in_portion + fee_out
-
-                trade_record = {
-                    "trade_id":    trade["trade_id"],
-                    "position_id": pid,
-                    "symbol":      trade["symbol"],
-                    "side":        trade["side"],
-                    "entry_ts":    trade["entry_ts"],
-                    "entry_price": trade["entry_price"],
-                    "qty":         trade["original_qty"],
-                    "fee_in":      trade["fee_in"],
-                    "mode":        trade["mode"],
-                    "exit_ts":     last_bar.ts,
-                    "exit_price":  exit_price,
-                    "pnl":         total_net_pnl,
-                    "pnl_pct":     total_net_pnl / (entry_price * trade["original_qty"]) * 100,
-                    "fees":        total_fees,
-                    "had_partial_close": trade["total_partial_pnl"] != Decimal("0"),
-                    "forced_close": True,
-                    "exit_type":   "forced",
-                    "sl_price":    trade.get("sl_price"),
-                    "tp1_price":   trade.get("tp1_price"),
-                    "tp2_price":   trade.get("tp2_price"),
-                    "entry_rsi":   trade.get("entry_rsi"),
-                    "entry_ema":   trade.get("entry_ema"),
-                }
-                result.trades.append(
-                    {k: str(v) if isinstance(v, Decimal) else v
-                     for k, v in trade_record.items()}
+                net_pnl = gross_pnl - fee_in_portion - fee_out
+                self._record_trade_leg(
+                    result, trade, exit_price, last_bar.ts,
+                    leg_qty=qty, leg_pnl=net_pnl,
+                    leg_fees=fee_in_portion + fee_out,
+                    exit_type="forced",
                 )
-                result.total_trades += 1
-                if total_net_pnl > 0:
-                    result.winning_trades += 1
-                else:
-                    result.losing_trades += 1
-                result.total_pnl += total_net_pnl
             open_trades.clear()
 
-        # ── Summary metrics ────────────────────────────────────────────────
+        # ── Summary metrics (per POSITION, not per leg) ───────────────────
         result.total_bars = total_bars
-        if result.total_trades > 0:
-            result.winrate = Decimal(str(
-                round(result.winning_trades / result.total_trades * 100, 1)
-            ))
-            result.avg_trade_pnl = result.total_pnl / result.total_trades
         result.total_pnl_pct = Decimal(str(
             round(float(result.total_pnl / self._initial_balance * 100), 2)
         ))
         result.exposure_pct = Decimal(str(
             round(bars_in_position / max(total_bars, 1) * 100, 2)
         ))
+
+        # Group legs by position_id to get position-level stats.
+        # A position is a WIN if its total PnL (across all legs) > 0.
+        _pos_pnl: dict[str, float] = {}
+        for _t in result.trades:
+            _pid = _t.get("position_id") or _t.get("trade_id", "")
+            _pos_pnl[_pid] = _pos_pnl.get(_pid, 0.0) + float(_t["pnl"])
+
+        n_pos = len(_pos_pnl)
+        n_win = sum(1 for p in _pos_pnl.values() if p > 0)
+        n_los = n_pos - n_win
+        result.total_trades   = n_pos
+        result.winning_trades = n_win
+        result.losing_trades  = n_los
+        if n_pos > 0:
+            result.winrate        = Decimal(str(round(n_win / n_pos * 100, 1)))
+            result.avg_trade_pnl  = result.total_pnl / Decimal(str(n_pos))
 
         if result.equity_curve:
             equities = [float(e["equity"]) for e in result.equity_curve]
@@ -607,10 +774,10 @@ class BacktestEngine:
                 max_dd = max(max_dd, dd)
             result.max_drawdown_pct = Decimal(str(round(max_dd, 2)))
 
-        if result.trades:
-            pnls = [float(t["pnl"]) for t in result.trades]
-            if len(pnls) >= 2 and np.std(pnls) > 0:
-                sharpe = np.mean(pnls) / np.std(pnls) * np.sqrt(len(pnls))
+        if _pos_pnl:
+            _pos_pnl_list = list(_pos_pnl.values())
+            if len(_pos_pnl_list) >= 2 and np.std(_pos_pnl_list) > 0:
+                sharpe = np.mean(_pos_pnl_list) / np.std(_pos_pnl_list) * np.sqrt(len(_pos_pnl_list))
                 result.sharpe_ratio = Decimal(str(round(sharpe, 3)))
 
         logger.info(
@@ -631,10 +798,10 @@ class BacktestEngine:
         exit_type: str = "close",
         is_final_partial: bool = False,
     ) -> None:
-        """Record a completed trade (accumulated partials or full close)."""
+        """Record a completed trade (legacy — now superseded by _record_trade_leg)."""
         entry_price = trade["entry_price"]
-        total_net_pnl = trade["total_partial_pnl"]
-        total_fees = trade["total_partial_fees"]
+        total_net_pnl = trade.get("total_partial_pnl", Decimal("0"))
+        total_fees = trade.get("total_partial_fees", Decimal("0"))
 
         trade_record = {
             "trade_id":    trade["trade_id"],
@@ -670,6 +837,63 @@ class BacktestEngine:
             result.losing_trades += 1
         result.total_pnl += total_net_pnl
         self._risk.record_fill(total_net_pnl)
+
+    def _record_trade_leg(
+        self,
+        result: "BacktestResult",
+        trade: dict,
+        exit_price: Decimal,
+        exit_ts: "datetime",
+        leg_qty: Decimal,
+        leg_pnl: Decimal,
+        leg_fees: Decimal,
+        exit_type: str = "close",
+    ) -> None:
+        """
+        Record a single exit leg as its own trade entry.
+
+        Each TP1, TP2, SL, BE_SL, or forced close gets its own record so
+        the user can see exactly how much each exit contributed to PnL.
+        Multiple leg records for the same position share the same
+        position_id so they can be grouped in the viewer.
+        """
+        entry_price = trade["entry_price"]
+        pct_of_orig = leg_qty / trade["original_qty"] if trade["original_qty"] > 0 else Decimal("0")
+        fee_in_part = trade["fee_in"] * pct_of_orig
+
+        trade_record = {
+            "trade_id":    str(uuid.uuid4()),
+            "position_id": trade.get("position_id", ""),
+            "symbol":      trade["symbol"],
+            "side":        trade["side"],
+            "entry_ts":    trade["entry_ts"],
+            "entry_price": entry_price,
+            "qty":         leg_qty,
+            "fee_in":      fee_in_part,
+            "mode":        trade["mode"],
+            "exit_ts":     exit_ts,
+            "exit_price":  exit_price,
+            "pnl":         leg_pnl,
+            "pnl_pct":     (leg_pnl / (entry_price * leg_qty) * 100
+                            if leg_qty > 0 and entry_price > 0
+                            else Decimal("0")),
+            "fees":        leg_fees,
+            "had_partial_close": False,
+            "exit_type":   exit_type,
+            "sl_price":    trade.get("sl_price"),
+            "tp1_price":   trade.get("tp1_price"),
+            "tp2_price":   trade.get("tp2_price"),
+            "entry_rsi":   trade.get("entry_rsi"),
+            "entry_ema":   trade.get("entry_ema"),
+        }
+        result.trades.append(
+            {k: str(v) if isinstance(v, Decimal) else v
+             for k, v in trade_record.items()}
+        )
+        # total_trades / winning_trades / losing_trades are computed at position
+        # level at the end of run() — do NOT increment per leg here.
+        result.total_pnl += leg_pnl
+        self._risk.record_fill(leg_pnl)
 
     # Keep legacy _record_completed_trade for any external callers
     def _record_completed_trade(self, result, open_trade, final_exit_price, exit_ts, final_fee_out, is_final_partial=False):

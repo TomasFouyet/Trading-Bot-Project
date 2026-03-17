@@ -12,7 +12,8 @@ COPY app/ ./app/
 COPY scripts/ ./scripts/
 
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e ".[dev]"
+    pip install --no-cache-dir -e ".[dev]" && \
+    pip install --no-cache-dir "optuna>=4.0.0"
 
 RUN mkdir -p /app/data/parquet /results
 

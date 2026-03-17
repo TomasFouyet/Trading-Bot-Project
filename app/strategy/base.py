@@ -53,6 +53,18 @@ class BaseStrategy(ABC):
             Signal with action = BUY | SELL | CLOSE | HOLD.
         """
 
+    @property
+    def engine_manages_sl_tp(self) -> bool:
+        """
+        If True (default), the backtest engine automatically closes positions
+        when bar high/low touches sl_price, tp1_price, or tp2_price stored in
+        the trade record.
+
+        Set to False in strategies that emit their own CLOSE/PARTIAL_CLOSE
+        signals (e.g. rsi_divergence), to avoid double-close.
+        """
+        return True
+
     def warm_up(self, bars: list[OHLCVBar]) -> None:
         """
         Pre-load historical bars to initialize indicator state.

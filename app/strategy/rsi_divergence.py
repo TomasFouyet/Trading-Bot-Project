@@ -77,23 +77,23 @@ class RSIDivergenceStrategy(BaseStrategy):
 
         # Indicator parameters
         self._rsi_period = int(self.params.get("rsi_period", 9))
-        self._ema_period = int(self.params.get("ema_period", 14))
+        self._ema_period = int(self.params.get("ema_period", 17))
 
         # Swing detection
-        self._swing_window = int(self.params.get("swing_window", 5))
-        self._swing_separation = int(self.params.get("swing_separation", 10))
+        self._swing_window = int(self.params.get("swing_window", 10))
+        self._swing_separation = int(self.params.get("swing_separation", 18))
         self._swing_lookback = int(self.params.get("swing_lookback", 100))
         self._trigger_window = int(self.params.get("trigger_window", 10))
 
         # Signal thresholds
-        self._rsi_oversold = float(self.params.get("rsi_oversold", 35.0))
-        self._rsi_overbought = float(self.params.get("rsi_overbought", 75.0))
+        self._rsi_oversold = float(self.params.get("rsi_oversold", 25.0))
+        self._rsi_overbought = float(self.params.get("rsi_overbought", 72.5))
         self._allow_short = bool(self.params.get("allow_short", True))
-        self._sl_buffer_pct = float(self.params.get("sl_buffer_pct", 0.003))
-        self._rr_ratio = float(self.params.get("rr_ratio", 1.5))
-        self._tp2_ratio = float(self.params.get("tp2_ratio", 1.75))
+        self._sl_buffer_pct = float(self.params.get("sl_buffer_pct", 0.012))
+        self._rr_ratio = float(self.params.get("rr_ratio", 3.25))
+        self._tp2_ratio = float(self.params.get("tp2_ratio", 3.9))
         self._min_trend_coeff = float(self.params.get("min_trend_coeff", 0.5))
-        self._entry_window = int(self.params.get("entry_window", 15))
+        self._entry_window = int(self.params.get("entry_window", 2))
         self._entry_cooldown = int(self.params.get("entry_cooldown_bars", 5))
 
         # Multi-position
@@ -135,6 +135,12 @@ class RSIDivergenceStrategy(BaseStrategy):
     @property
     def min_bars_required(self) -> int:
         return self._rsi_period + 1 + self._swing_lookback + self._swing_window * 2
+
+    @property
+    def engine_manages_sl_tp(self) -> bool:
+        # rsi_divergence emits its own CLOSE/PARTIAL_CLOSE signals — disable
+        # the engine's automatic SL/TP check to avoid double-close.
+        return False
 
     # ── Scan context helpers ──────────────────────────────────────────────────
 

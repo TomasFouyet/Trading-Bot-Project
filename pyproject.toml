@@ -28,6 +28,7 @@ dependencies = [
     "numpy>=1.26.0",
     "pyarrow>=16.0.0",
     "duckdb>=0.10.0",
+    "optuna>=4.0.0",
     # Metrics
     "prometheus-client>=0.20.0",
     # Utils

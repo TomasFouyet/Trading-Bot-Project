@@ -114,6 +114,11 @@ class HybridRSIPivotStrategy(RSIDivergenceStrategy):
         # Need: 1 full previous day for Pivot Points + swing lookback + RSI warmup
         return self._bars_per_day + self._rsi_period + 1 + self._swing_lookback + self._swing_window * 2
 
+    @property
+    def engine_manages_sl_tp(self) -> bool:
+        # hybrid_rsi_pivot emits its own CLOSE signals — disable engine auto-close.
+        return False
+
     # ── New indicator methods ─────────────────────────────────────────────────
 
     def _compute_atr(self, bars: pd.DataFrame) -> pd.Series:
