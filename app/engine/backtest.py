@@ -416,6 +416,7 @@ class BacktestEngine:
                             # Mark TP1 as hit and move SL to breakeven
                             _tr["tp1_hit"]  = True
                             _tr["sl_price"] = float(_tr["entry_price"])
+                            _tr["tp1_price"] = None  # FIX: TP1 consumed — stop reporting in position_meta
                         logger.debug(
                             "sl_tp_triggered",
                             pid=_pid, exit_type=_exit_type,
@@ -465,6 +466,9 @@ class BacktestEngine:
                 if open_trades:
                     _first = next(iter(open_trades.values()))
                     _pos_state = _first["side"]  # "LONG" or "SHORT"
+                    # FIX: Reflect BE phase after TP1 hit so viewer shows correct state badge
+                    if _first.get("tp1_hit"):
+                        _pos_state = _pos_state + "_BE"  # "LONG_BE" or "SHORT_BE"
                     _pos_sl    = _first.get("sl_price")
                     _pos_tp1   = _first.get("tp1_price")
                     _pos_tp2   = _first.get("tp2_price")
@@ -475,7 +479,11 @@ class BacktestEngine:
 
                 position_meta: dict = {"state": _pos_state}
                 if _pos_sl    is not None: position_meta["sl"]    = _pos_sl
-                if _pos_tp1   is not None: position_meta["tp"]    = _pos_tp1
+                # FIX: After TP1 hit, tp1 is None → "tp" should show tp2 as active target
+                if _pos_tp1 is not None:
+                    position_meta["tp"] = _pos_tp1
+                elif _pos_tp2 is not None:
+                    position_meta["tp"] = _pos_tp2
                 if _pos_tp2   is not None: position_meta["tp2"]   = _pos_tp2
                 if _pos_entry is not None: position_meta["entry"] = _pos_entry
 

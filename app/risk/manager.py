@@ -79,6 +79,7 @@ class RiskManager:
             equity=str(equity),
             max_daily_dd_pct=str(self._max_daily_dd),
             max_position_pct=str(self._max_position_pct),
+            max_trade_risk_pct=str(self._max_trade_risk_pct),
         )
 
     def update_equity(self, equity: Decimal, as_of_date: date | None = None) -> None:
@@ -138,21 +139,22 @@ class RiskManager:
             return False, "Zero or negative equity"
 
         # 5. Position size check
-        proposed_notional = self._estimate_notional(signal, current_equity)
-        position_pct = (current_position_value + proposed_notional) / current_equity * 100
-        if position_pct > self._max_position_pct:
-            return (
-                False,
-                f"Position {position_pct:.1f}% would exceed max {self._max_position_pct}%",
+        # When SL is provided: risk-based sizing is used in compute_order_qty,
+        # which already caps the qty at max_position_pct. No need to check notional
+        # here — the notional can legitimately exceed max_position_pct% (e.g. 1%
+        # risk with a tight SL produces a larger notional, which is correct).
+        if signal.stop_loss is None:
+            # Fallback notional check for strategies that don't provide a stop_loss
+            proposed_notional = self._estimate_notional(signal, current_equity)
+            position_pct = (
+                (current_position_value + proposed_notional) / current_equity * 100
             )
-
-        # 6. Trade risk check (only if stop loss provided)
-        if signal.stop_loss is not None:
-            # Estimate risk based on stop distance
-            # For BUY: risk = (entry - stop_loss) * qty
-            # We approximate entry as current_equity * position_pct / 100 / price
-            # Simple check: stop distance % of current price
-            pass  # Full implementation requires current price — handled in engine
+            if position_pct > self._max_position_pct:
+                return (
+                    False,
+                    f"Position {position_pct:.1f}% would exceed max "
+                    f"{self._max_position_pct}%",
+                )
 
         return True, "approved"
 
@@ -163,14 +165,49 @@ class RiskManager:
         price: Decimal,
     ) -> Decimal:
         """
-        Compute order quantity based on max position % of equity.
-        Uses signal.confidence as a scaling factor.
+        Compute order quantity using RISK-BASED sizing when stop_loss is provided,
+        falling back to notional-based sizing otherwise.
+
+        Risk-based sizing (preferred for strategies with SL):
+          risk_amount = equity × max_trade_risk_pct / 100 × confidence
+          risk_per_unit = |price - stop_loss|
+          qty = risk_amount / risk_per_unit
+
+          This means: "I'm willing to lose X% of my portfolio if SL hits."
+          With 1% risk, $10k equity, and SL 2% away → position = $5k notional (50% of equity).
+
+        Notional-based sizing (fallback for strategies without SL):
+          qty = equity × max_position_pct / 100 × confidence / price
+
+        Both are capped at max_position_pct of equity to prevent overexposure.
         """
         if signal.target_qty is not None:
             return signal.target_qty
 
+        confidence = Decimal(str(signal.confidence))
+
+        # ── Risk-based sizing (when SL is available) ─────────────────────
+        if signal.stop_loss is not None and signal.stop_loss > 0:
+            risk_per_unit = abs(price - signal.stop_loss)
+
+            if risk_per_unit > 0:
+                # How much $ we're willing to lose on this trade
+                risk_amount = current_equity * (self._max_trade_risk_pct / 100) * confidence
+
+                # Position size from risk
+                qty = risk_amount / risk_per_unit
+
+                # Cap at max_position_pct of equity (notional cap)
+                max_notional = current_equity * (self._max_position_pct / 100)
+                max_qty = max_notional / price
+                qty = min(qty, max_qty)
+
+                qty = qty.quantize(Decimal("0.001"))
+                return max(qty, Decimal("0.001"))
+
+        # ── Fallback: notional-based sizing (no SL provided) ─────────────
         max_notional = current_equity * (self._max_position_pct / 100)
-        scaled_notional = max_notional * Decimal(str(signal.confidence))
+        scaled_notional = max_notional * confidence
         qty = scaled_notional / price
 
         # Round to reasonable precision
@@ -178,9 +215,8 @@ class RiskManager:
         return max(qty, Decimal("0.001"))
 
     def _estimate_notional(self, signal: Signal, equity: Decimal) -> Decimal:
-        """Rough notional estimate for position size check."""
+        """Rough notional estimate — used only for the no-SL fallback check."""
         if signal.target_qty is not None:
-            # Can't know price here — use conservative estimate
             return equity * (self._max_position_pct / 100)
         return equity * (self._max_position_pct / 100) * Decimal(str(signal.confidence))
 
