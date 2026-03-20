@@ -252,6 +252,10 @@ class BacktestEngine:
                         "entry_rsi": sig.meta.get("rsi"),
                         "entry_ema": sig.meta.get("ema"),
                         "tp1_hit": False,
+                        # Adaptive layers from signal meta
+                        "tp1_close_pct": sig.meta.get("tp1_close_pct"),
+                        "soft_sl_bars": sig.meta.get("soft_sl_bars", 0),
+                        "bars_in_trade": 0,
                     }
                     _newly_opened_pids.add(pid)
                     logger.debug("backtest_entry", side=side_str, price=str(fill.price),
@@ -265,16 +269,11 @@ class BacktestEngine:
 
                     if pid in open_trades:
                         trade = open_trades[pid]
-                        # Use the strategy-provided limit price (TP/SL level) when available,
-                        # so PnL reflects the actual trigger level rather than next-bar open.
-                        # Limit exits (SL/TP pre-placed orders) use maker fee rate.
-                        intended_price = pc.get("limit_price")
-                        if intended_price is not None:
-                            exit_price = Decimal(str(intended_price))
-                            fee_out = exit_price * fill.qty * self._maker_commission
-                        else:
-                            exit_price = fill.price
-                            fee_out = fill.fee
+                        # Always use the REAL fill price for PnL and cash consistency.
+                        # The adapter charges cash at fill.price (next-bar open ± slippage),
+                        # so PnL must match to avoid equity curve drift.
+                        exit_price = fill.price
+                        fee_out = fill.fee
                         entry_price = trade["entry_price"]
                         closed_qty = fill.qty
                         is_long = trade["side"] == "LONG"
@@ -300,6 +299,13 @@ class BacktestEngine:
                         )
 
                         if trade["qty"] < Decimal("0.0001"):
+                            # Position fully closed — notify strategy for streak tracking (Layer 3)
+                            _pos_won = sum(
+                                float(t["pnl"]) for t in result.trades
+                                if t.get("position_id") == pid
+                            ) > 0
+                            if hasattr(self._strategy, "notify_trade_result"):
+                                self._strategy.notify_trade_result(won=_pos_won)
                             del open_trades[pid]
 
             # ── Expire stale limit entry orders ────────────────────────────
@@ -328,7 +334,7 @@ class BacktestEngine:
             # Strategies that emit their own CLOSE/PARTIAL_CLOSE (e.g.
             # rsi_divergence) set engine_manages_sl_tp = False to avoid
             # double-closing.
-            _tp1_close_pct = float(self._strategy.params.get("tp1_close_pct", 0.70))
+            _default_tp1_close_pct = float(self._strategy.params.get("tp1_close_pct", 0.70))
             _pending_pids   = {v.get("position_id") for v in pending_closes.values()}
             _engine_sl_tp   = getattr(self._strategy, "engine_manages_sl_tp", True)
 
@@ -347,27 +353,37 @@ class BacktestEngine:
                 _is_lng = _tr["side"] == "LONG"
                 _bh     = float(bar.high)
                 _bl     = float(bar.low)
+                _bc     = float(bar.close)
+
+                # Layer 1: Read per-trade tp1_close_pct from signal meta (adaptive confidence)
+                _tp1_close_pct = _tr.get("tp1_close_pct", _default_tp1_close_pct)
+
+                # Layer 4: Patience timer — soft SL for first N bars
+                # During patience period, SL only triggers on bar CLOSE (not wick)
+                _tr["bars_in_trade"] = _tr.get("bars_in_trade", 0) + 1
+                _soft_sl_bars = _tr.get("soft_sl_bars", 0)
+                _in_patience = _soft_sl_bars > 0 and _tr["bars_in_trade"] <= _soft_sl_bars
 
                 _exit_px   = None
                 _exit_type = None
                 _cls_pct   = 1.0  # default: full close
 
                 if _is_lng:
-                    if _sl is not None and _bl <= _sl:
-                        # Stop-loss hit
+                    # SL check — use close price during patience, low price after
+                    _sl_trigger = _bc if _in_patience else _bl
+                    if _sl is not None and _sl_trigger <= _sl:
                         _exit_px   = _sl
                         _exit_type = "be_sl" if _tr.get("tp1_hit") else "sl"
                     elif _tp2 is not None and _bh >= _tp2 and _tr.get("tp1_hit"):
-                        # TP2 hit (remaining qty)
                         _exit_px   = _tp2
                         _exit_type = "tp2"
                     elif _tp1 is not None and _bh >= _tp1 and not _tr.get("tp1_hit"):
-                        # TP1 hit (first time)
                         _exit_px   = _tp1
                         _exit_type = "tp1"
                         _cls_pct   = _tp1_close_pct if _tp2 is not None else 1.0
                 else:  # SHORT
-                    if _sl is not None and _bh >= _sl:
+                    _sl_trigger = _bc if _in_patience else _bh
+                    if _sl is not None and _sl_trigger >= _sl:
                         _exit_px   = _sl
                         _exit_type = "be_sl" if _tr.get("tp1_hit") else "sl"
                     elif _tp2 is not None and _bl <= _tp2 and _tr.get("tp1_hit"):
@@ -404,6 +420,7 @@ class BacktestEngine:
                             "sl_tp_triggered",
                             pid=_pid, exit_type=_exit_type,
                             exit_px=_exit_px, bar_ts=bar.ts.isoformat(),
+                            patience=_in_patience,
                         )
 
             # 2. Build strategy window
@@ -685,19 +702,19 @@ class BacktestEngine:
                             "entry_rsi": sig.meta.get("rsi"),
                             "entry_ema": sig.meta.get("ema"),
                             "tp1_hit": False,
+                            # Adaptive layers from signal meta
+                            "tp1_close_pct": sig.meta.get("tp1_close_pct"),
+                            "soft_sl_bars": sig.meta.get("soft_sl_bars", 0),
+                            "bars_in_trade": 0,
                         }
                     elif fill.order_id in pending_closes:
                         pc = pending_closes.pop(fill.order_id)
                         pid = pc["position_id"]
                         if pid in open_trades:
                             trade = open_trades[pid]
-                            intended_price = pc.get("limit_price")
-                            if intended_price is not None:
-                                exit_price = Decimal(str(intended_price))
-                                fee_out = exit_price * fill.qty * self._commission
-                            else:
-                                exit_price = fill.price
-                                fee_out = fill.fee
+                            # Use real fill price for PnL consistency with adapter cash
+                            exit_price = fill.price
+                            fee_out = fill.fee
                             entry_price = trade["entry_price"]
                             closed_qty = fill.qty
                             is_long = trade["side"] == "LONG"
@@ -714,6 +731,13 @@ class BacktestEngine:
                                 exit_type=pc.get("exit_type", "close"),
                             )
                             if trade["qty"] < Decimal("0.0001"):
+                                # Position fully closed — notify strategy (Layer 3)
+                                _pos_won = sum(
+                                    float(t["pnl"]) for t in result.trades
+                                    if t.get("position_id") == pid
+                                ) > 0
+                                if hasattr(self._strategy, "notify_trade_result"):
+                                    self._strategy.notify_trade_result(won=_pos_won)
                                 del open_trades[pid]
 
         # ── Force-close remaining open positions at end ───────────────────
@@ -736,6 +760,9 @@ class BacktestEngine:
                     leg_fees=fee_in_portion + fee_out,
                     exit_type="forced",
                 )
+                # Notify strategy of forced close result (Layer 3)
+                if hasattr(self._strategy, "notify_trade_result"):
+                    self._strategy.notify_trade_result(won=net_pnl > 0)
             open_trades.clear()
 
         # ── Summary metrics (per POSITION, not per leg) ───────────────────

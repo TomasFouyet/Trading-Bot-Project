@@ -92,6 +92,7 @@ async def main(args: argparse.Namespace) -> None:
         }
     elif args.strategy == "trend_following":
         strategy_params = {
+            # Core
             "adx_min":               args.adx_min,
             "min_rr":                args.min_rr,
             "pullback_tolerance_atr": args.pullback_tolerance_atr,
@@ -99,6 +100,25 @@ async def main(args: argparse.Namespace) -> None:
             "ema_fast":              args.ema_fast_tf,
             "ema_slow":              args.ema_slow_tf,
             "slope_bars":            args.slope_bars,
+            # Layer 1: Confidence
+            "use_confidence":        args.tf_use_confidence,
+            "adx_strong":            args.tf_adx_strong,
+            "tight_pb_atr":          args.tf_tight_pb_atr,
+            "min_confidence":        args.tf_min_confidence,
+            # Layer 2: Session
+            "use_session_filter":    args.tf_use_session,
+            "us_session_start":      args.tf_us_start,
+            "us_session_end":        args.tf_us_end,
+            "session_mult_us":       args.tf_sess_us,
+            "session_mult_eu":       args.tf_sess_eu,
+            "session_mult_other":    args.tf_sess_other,
+            # Layer 3: Streak
+            "use_streak_adj":        args.tf_use_streak,
+            "streak_euphoria_after": args.tf_streak_after,
+            "streak_euphoria_mult":  args.tf_streak_mult,
+            # Layer 4: Patience
+            "use_patience":          args.tf_use_patience,
+            "soft_sl_bars":          args.tf_soft_sl_bars,
         }
     elif args.strategy == "event_driven":
         strategy_params = {
@@ -229,7 +249,7 @@ if __name__ == "__main__":
                         help="Require price near an HTF S/R zone (Pupupu zones)")
     parser.add_argument("--sr-zone-pct", type=float, default=0.005, dest="sr_zone_pct",
                         help="Proximity threshold for S/R zones as fraction of price (default: 0.005 = 0.5%%)")
-    parser.add_argument("--tp1-close-pct", type=float, default=0.70, dest="tp1_close_pct",
+    parser.add_argument("--tp1-close-pct", type=float, default=0.33, dest="tp1_close_pct",
                         help="Fraction of position closed at TP1 (Cali recommends 0.75)")
 
     # Hybrid RSI Pivot params
@@ -261,6 +281,56 @@ if __name__ == "__main__":
                         help="EMA lenta para trend following (proxy trend diario)")
     parser.add_argument("--slope-bars", type=int, default=5, dest="slope_bars",
                         help="Barras para medir pendiente de EMA lenta")
+
+    # ── Trend Following: Layer 1 — Confidence Scoring ──────────────────────
+    parser.add_argument("--tf-use-confidence", action="store_true", default=True,
+                        dest="tf_use_confidence",
+                        help="Enable confidence scoring (Layer 1)")
+    parser.add_argument("--tf-no-confidence", action="store_false", dest="tf_use_confidence",
+                        help="Disable confidence scoring")
+    parser.add_argument("--tf-adx-strong", type=float, default=35.0, dest="tf_adx_strong",
+                        help="ADX threshold for 'strong trend' bonus (default: 35)")
+    parser.add_argument("--tf-tight-pb-atr", type=float, default=0.5, dest="tf_tight_pb_atr",
+                        help="ATR multiplier for 'tight pullback' bonus (default: 0.5)")
+    parser.add_argument("--tf-min-confidence", type=float, default=0.40, dest="tf_min_confidence",
+                        help="Minimum confidence score to allow entry (default: 0.40)")
+
+    # ── Trend Following: Layer 2 — Session-Aware Sizing ────────────────────
+    parser.add_argument("--tf-use-session", action="store_true", default=True,
+                        dest="tf_use_session",
+                        help="Enable session-aware sizing (Layer 2)")
+    parser.add_argument("--tf-no-session", action="store_false", dest="tf_use_session",
+                        help="Disable session-aware sizing")
+    parser.add_argument("--tf-us-start", type=int, default=14, dest="tf_us_start",
+                        help="US session start hour UTC (default: 14)")
+    parser.add_argument("--tf-us-end", type=int, default=21, dest="tf_us_end",
+                        help="US session end hour UTC (default: 21)")
+    parser.add_argument("--tf-sess-us", type=float, default=1.0, dest="tf_sess_us",
+                        help="Size multiplier for US session (default: 1.0)")
+    parser.add_argument("--tf-sess-eu", type=float, default=0.75, dest="tf_sess_eu",
+                        help="Size multiplier for EU session (default: 0.75)")
+    parser.add_argument("--tf-sess-other", type=float, default=0.50, dest="tf_sess_other",
+                        help="Size multiplier for Asia/night (default: 0.50)")
+
+    # ── Trend Following: Layer 3 — Streak Adjuster ─────────────────────────
+    parser.add_argument("--tf-use-streak", action="store_true", default=True,
+                        dest="tf_use_streak",
+                        help="Enable anti-euphoria streak adjuster (Layer 3)")
+    parser.add_argument("--tf-no-streak", action="store_false", dest="tf_use_streak",
+                        help="Disable streak adjuster")
+    parser.add_argument("--tf-streak-after", type=int, default=2, dest="tf_streak_after",
+                        help="Reduce size after N consecutive wins (default: 2)")
+    parser.add_argument("--tf-streak-mult", type=float, default=0.75, dest="tf_streak_mult",
+                        help="Size multiplier after win streak (default: 0.75)")
+
+    # ── Trend Following: Layer 4 — Patience Timer ──────────────────────────
+    parser.add_argument("--tf-use-patience", action="store_true", default=True,
+                        dest="tf_use_patience",
+                        help="Enable soft SL patience timer (Layer 4)")
+    parser.add_argument("--tf-no-patience", action="store_false", dest="tf_use_patience",
+                        help="Disable patience timer")
+    parser.add_argument("--tf-soft-sl-bars", type=int, default=48, dest="tf_soft_sl_bars",
+                        help="Bars for soft SL (close-only, default: 48 = 12h at 15min)")
 
     # ── Event Driven params ────────────────────────────────────────────────────
     parser.add_argument("--vol-multiplier", type=float, default=2.0, dest="vol_multiplier",

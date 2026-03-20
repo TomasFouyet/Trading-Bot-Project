@@ -440,6 +440,7 @@ let bbUpperArr = [], bbLowerArr = [];
 let markers = [];
 let processedExits = new Set();
 let wins = 0, losses = 0, closedTrades = 0;
+let positionPnl = {};
 let entryMap = {}, exitMap = {};
 let activeTrade = null;
 let tradeFilter = 'all';
@@ -565,8 +566,16 @@ function setElCls(id, val, c) {
 function renderTradeList() {
   const container = document.getElementById('trade-items');
   container.innerHTML = '';
+  // Group trades by position_id for correct PnL coloring
+  const posPnl = {};
+  trades.forEach(t => {
+    const pid = t.position_id || t.trade_id;
+    posPnl[pid] = (posPnl[pid] || 0) + parseFloat(t.pnl || 0);
+  });
   trades.forEach((t, i) => {
-    const pnl  = parseFloat(t.pnl || 0);
+    const legPnl = parseFloat(t.pnl || 0);
+    const pid    = t.position_id || t.trade_id;
+    const totalPnl = posPnl[pid] || legPnl;
     const side = (t.side || 'LONG').toUpperCase();
     const ep   = parseFloat(t.entry_price);
     const xp   = t.exit_price ? parseFloat(t.exit_price) : null;
@@ -574,7 +583,7 @@ function renderTradeList() {
     const xlbl = EXIT_TYPE_LABEL[xt] || xt.toUpperCase();
     const xcls = EXIT_TYPE_CLASS[xt]  || 'frc';
 
-    const isWin  = pnl >= 0;
+    const isWin  = totalPnl >= 0;
     const show   = tradeFilter === 'all' || (tradeFilter === 'win' && isWin) || (tradeFilter === 'loss' && !isWin);
     if (!show) return;
 
@@ -586,7 +595,7 @@ function renderTradeList() {
       <div class="tc-header">
         <span class="tc-side ${side.toLowerCase()}">${side}</span>
         <span class="tc-type ${xcls}">${xlbl}</span>
-        <span class="tc-pnl ${isWin?'pos':'neg'}">${fmtPnl(pnl)}</span>
+        <span class="tc-pnl ${legPnl>=0?'pos':'neg'}">${fmtPnl(legPnl)}</span>
       </div>
       <div class="tc-prices">
         Entrada: <span>${fmtN(ep,1)}</span>
@@ -698,7 +707,7 @@ function resetPlayback() {
   slArr = []; tp1Arr = []; tp2Arr = []; entryArr = [];
   bbUpperArr = []; bbLowerArr = [];
   processedExits = new Set();
-  wins = 0; losses = 0; closedTrades = 0;
+  wins = 0; losses = 0; closedTrades = 0; positionPnl = {};
   activeTrade = null; maxEquity = initBalance;
 
   document.querySelectorAll('.trade-card').forEach(el => el.classList.remove('won','lost','active-card'));
@@ -858,9 +867,25 @@ function applyBar(idx, animate) {
     const pnl = +tr.pnl;
     const xp  = +tr.exit_price;
     const xt  = tr.exit_type || 'close';
+
+    // Position-level win/loss: accumulate PnL per position_id,
+    // only count the position as closed when ALL its legs are processed.
+    const pid = tr.position_id || tr.trade_id || ti;
+    if (!positionPnl[pid]) positionPnl[pid] = { total: 0, legsTotal: 0, legsSeen: 0 };
+    const pp = positionPnl[pid];
+    pp.total += pnl;
+    pp.legsSeen++;
+    // Count how many legs this position has in the trades array
+    if (pp.legsTotal === 0) {
+      pp.legsTotal = trades.filter(tt => (tt.position_id || tt.trade_id) === pid).length;
+    }
+    // Only count the position when the LAST leg arrives
+    if (pp.legsSeen >= pp.legsTotal) {
+      closedTrades++;
+      if (pp.total >= 0) wins++; else losses++;
+    }
+
     const isWin = pnl >= 0;
-    closedTrades++;
-    if (isWin) wins++; else losses++;
 
     const colors = { tp1:'#60a5fa', tp2:'#3fb950', sl:'#f85149', be_sl:'#d29922', forced:'#8b949e', close:'#8b949e' };
     const clr = colors[xt] || (isWin ? '#3fb950' : '#f85149');

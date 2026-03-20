@@ -1,0 +1,26 @@
+{
+  "params": {
+    "adx_min": 20,
+    "adx_strong": 35,
+    "min_confidence": 0,
+    "pullback_tolerance_atr": 1,
+    "session_mult_eu": 0.75,
+    "session_mult_other": 0.5,
+    "soft_sl_bars": 48,
+    "streak_euphoria_mult": 0.75,
+    "tp1_close_pct": 0.33,
+    "use_confidence": true,
+    "use_patience": true,
+    "use_session_filter": true,
+    "use_streak_adj": true
+  },
+  "metrics": {
+    "score": 6.6655,
+    "winrate": 52.8,
+    "total_pnl": 125.9082,
+    "total_pnl_pct": 1.26,
+    "sharpe_ratio": 2.003,
+    "max_drawdown_pct": 0.43,
+    "total_trades": 176.0
+  }
+}
