@@ -413,17 +413,25 @@ class BacktestEngine:
                             "limit_price": _exit_px,
                         }
                         if _exit_type == "tp1":
-                            # Mark TP1 as hit and move SL to breakeven
-                            _tr["tp1_hit"]  = True
-                            _tr["sl_price"] = float(_tr["entry_price"])
-                            _tr["tp1_price"] = None  # FIX: TP1 consumed — stop reporting in position_meta
+                            _tr["tp1_hit"] = True
+                            _tr["tp1_price"] = None
+
+                            _entry = Decimal(str(_tr["entry_price"]))
+                            _fee_buffer = _entry * Decimal("0.002")  # 0.2%
+
+                            if _is_lng:
+                                _tr["sl_price"] = float(_entry + _fee_buffer)
+                            else:
+                                _tr["sl_price"] = float(_entry - _fee_buffer)
+
+                            _tr["soft_sl_bars"] = 0
+
                         logger.debug(
                             "sl_tp_triggered",
                             pid=_pid, exit_type=_exit_type,
                             exit_px=_exit_px, bar_ts=bar.ts.isoformat(),
                             patience=_in_patience,
                         )
-
             # 2. Build strategy window
             window_start = max(0, i + 1 - WINDOW_SIZE)
             window = bars[window_start: i + 1]

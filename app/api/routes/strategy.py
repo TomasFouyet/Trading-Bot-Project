@@ -23,7 +23,7 @@ class BacktestRequest(BaseModel):
     end: str = Field(..., description="ISO datetime, e.g. 2024-06-01T00:00:00")
     strategy_name: str = "ema_cross"
     strategy_params: dict = Field(default_factory=dict)
-    initial_balance: float = 10000.0
+    initial_balance: float = 1000.0
     commission_bps: float | None = None
     slippage_bps: float | None = None
 

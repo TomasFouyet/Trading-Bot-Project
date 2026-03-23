@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     prometheus_port: int = 8001
     environment: str = "development"
 
+    # ── Notifications ────────────────────────────────────────
+    telegram_bot_token: str = Field(default="", repr=False)
+    telegram_chat_id: str = Field(default="", repr=False)
+
     @model_validator(mode="after")
     def _warn_missing_keys(self) -> "Settings":
         if self.bot_mode == BotMode.REAL:
