@@ -123,7 +123,9 @@ class OHLCVIngestor:
                 break
 
             if not raw_bars:
-                break
+                # No data for this window — advance cursor and continue
+                cursor = batch_end + timedelta(seconds=tf_secs)
+                continue
 
             bars = [
                 OHLCVBar(

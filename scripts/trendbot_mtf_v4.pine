@@ -1,0 +1,655 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// TrendBot MTF v4 — Synced with Python run_multi_paper.py
+// ══════════════════════════════════════════════════════════════════════════════
+// CHANGES vs v3:
+//   SYNC 1 — SL now uses swing structure + ATR clamp (matches Python _compute_sl)
+//            Finds last confirmed pivot (HL for long, LH for short) in lookback,
+//            takes the more protective of [swing, ema_slow], adds ATR buffer,
+//            then clamps to [sl_min_atr, sl_max_atr] range.
+//   SYNC 2 — Tier C added to tier classification (conf < 0.40)
+//   SYNC 3 — Size multiplier per tier shown in panel (A=2x, B=1.5x, C=0.5x)
+//   SYNC 4 — TP1 close % per tier shown in panel (A=33%, B=50%, C=70%)
+//   SYNC 5 — SL method shown in panel (swing vs lookback)
+//   FIX 1 — Cooldown between signals of same type
+//   FIX 2 — Only 1 label active per direction
+//   FIX 3 — Box extension configurable, delete before redraw
+//   FIX 4+5 — Panel without merge_cells
+//   FIX 6 — draw_levels uses var globals
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("TrendBot MTF v4", shorttitle="TBot4", overlay=true,
+          max_lines_count=20, max_labels_count=30, max_boxes_count=20)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+var g_core = "═══ Estrategia 15M ═══"
+adx_min      = input.int(20,    "ADX mínimo",             group=g_core, minval=10, maxval=50)
+adx_strong   = input.int(35,    "ADX fuerte (★)",          group=g_core, minval=20, maxval=60)
+ema_fast     = input.int(20,    "EMA rápida (15M)",        group=g_core, minval=5,  maxval=50)
+ema_slow     = input.int(50,    "EMA lenta (15M)",         group=g_core, minval=20, maxval=200)
+pb_tol_atr   = input.float(1.0, "Pullback tolerancia ATR", group=g_core, minval=0.2, maxval=3.0, step=0.1)
+min_conf     = input.float(0.0, "Confianza mínima",        group=g_core, minval=0.0, maxval=1.0, step=0.05)
+allow_short  = input.bool(true,  "Permitir SHORTS",        group=g_core)
+sig_cooldown = input.int(5,     "Cooldown entre señales (barras)", group=g_core, minval=1, maxval=50)
+
+var g_htf = "═══ Bias 4H ═══"
+htf_tf       = input.timeframe("240", "Timeframe HTF",    group=g_htf)
+htf_ema_f    = input.int(50,   "HTF EMA rápida",          group=g_htf, minval=10, maxval=100)
+htf_ema_s    = input.int(200,  "HTF EMA lenta",            group=g_htf, minval=50, maxval=500)
+show_htf_bg  = input.bool(true,  "Fondo bias 4H",         group=g_htf)
+show_htf_ema = input.bool(true,  "Mostrar EMAs 4H",       group=g_htf)
+
+var g_ltf = "═══ Entrada 5M ═══"
+ltf_tf       = input.timeframe("5", "Timeframe LTF",      group=g_ltf)
+show_ltf_ema = input.bool(true,  "Mostrar EMA9 (5M)",     group=g_ltf)
+
+var g_sl = "═══ SL / TP ═══"
+sl_swing_lookback = input.int(50, "SL swing lookback (barras)", group=g_sl, minval=10, maxval=200)
+sl_swing_window   = input.int(3,  "SL swing window (barras c/lado)", group=g_sl, minval=1, maxval=10)
+sl_min_atr   = input.float(1.0, "SL mínimo (ATR)",        group=g_sl, step=0.1)
+sl_max_atr   = input.float(2.5, "SL máximo (ATR)",        group=g_sl, step=0.1)
+sl_buf_atr   = input.float(0.3, "SL buffer (ATR)",        group=g_sl, step=0.1)
+tp1_r_A      = input.float(1.5, "TP1 R (Tier A)",         group=g_sl, step=0.1)
+tp2_r_A      = input.float(3.0, "TP2 R (Tier A)",         group=g_sl, step=0.1)
+tp1_r_B      = input.float(1.5, "TP1 R (Tier B)",         group=g_sl, step=0.1)
+tp2_r_B      = input.float(2.5, "TP2 R (Tier B)",         group=g_sl, step=0.1)
+tp1_r_C      = input.float(1.0, "TP1 R (Tier C)",         group=g_sl, step=0.1)
+tp2_r_C      = input.float(1.5, "TP2 R (Tier C)",         group=g_sl, step=0.1)
+
+var g_vis = "═══ Visual ═══"
+show_signals = input.bool(true,  "Señales de entrada",    group=g_vis)
+show_sl_tp   = input.bool(true,  "Cajas SL / TP",        group=g_vis)
+show_panel   = input.bool(true,  "Panel de información",  group=g_vis)
+show_session = input.bool(true,  "Fondo de sesión",       group=g_vis)
+show_adx_lbl = input.bool(true,  "Label ADX en último bar", group=g_vis)
+box_bars     = input.int(40,    "Extensión cajas (barras)", group=g_vis, minval=5, maxval=200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORES
+// ─────────────────────────────────────────────────────────────────────────────
+C_BULL     = color.new(#1D9E75, 0)
+C_BEAR     = color.new(#E24B4A, 0)
+C_NEUT     = color.new(#888780, 0)
+C_AMBER    = color.new(#EF9F27, 0)
+C_BLUE     = color.new(#3B8BD4, 0)
+C_BG_BULL  = color.new(#1D9E75, 92)
+C_BG_BEAR  = color.new(#E24B4A, 92)
+C_BG_US    = color.new(#3B8BD4, 95)
+C_BG_EU    = color.new(#EF9F27, 95)
+C_PANEL_BG = color.new(#0d0d1a, 5)
+C_CELL_DIM = color.new(#0d0d1a, 25)
+C_OK       = color.new(#1D9E75, 25)
+C_WARN     = color.new(#EF9F27, 40)
+C_BAD      = color.new(#E24B4A, 30)
+C_MID      = color.new(#888780, 45)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COUNTDOWN
+// ─────────────────────────────────────────────────────────────────────────────
+tf_secs       = timeframe.in_seconds()
+elapsed       = math.floor((timenow - time) / 1000)
+remaining     = tf_secs - elapsed
+rem_min       = math.floor(remaining / 60)
+rem_sec       = remaining - rem_min * 60
+countdown_str = str.tostring(rem_min) + "m " + (rem_sec < 10 ? "0" : "") + str.tostring(rem_sec) + "s"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15M INDICATORS
+// ─────────────────────────────────────────────────────────────────────────────
+atr14                          = ta.atr(14)
+[diplus, diminus, adx_val]     = ta.dmi(14, 14)
+ema_f_line                     = ta.ema(close, ema_fast)
+ema_s_line                     = ta.ema(close, ema_slow)
+ema_s_slope                    = ema_s_line - ema_s_line[5]
+ema_f_slope                    = ema_f_line - ema_f_line[5]
+[macd_line, macd_sig_line, macd_hist] = ta.macd(close, 12, 26, 9)
+vol_sma                        = ta.sma(volume, 20)
+vol_ratio                      = vol_sma > 0 ? volume / vol_sma : 0.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4H HTF DATA
+// ─────────────────────────────────────────────────────────────────────────────
+f_htf_adx() =>
+    [_p, _m, _adx] = ta.dmi(14, 14)
+    _adx
+
+f_htf_macd() =>
+    [_ml, _sl, _h] = ta.macd(close, 12, 26, 9)
+    _ml
+
+htf_close = request.security(syminfo.tickerid, htf_tf, close,                    lookahead=barmerge.lookahead_off)
+htf_ef    = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_f), lookahead=barmerge.lookahead_off)
+htf_es    = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_s), lookahead=barmerge.lookahead_off)
+htf_adx   = request.security(syminfo.tickerid, htf_tf, f_htf_adx(),              lookahead=barmerge.lookahead_off)
+htf_atr   = request.security(syminfo.tickerid, htf_tf, ta.atr(14),               lookahead=barmerge.lookahead_off)
+htf_macd  = request.security(syminfo.tickerid, htf_tf, f_htf_macd(),             lookahead=barmerge.lookahead_off)
+htf_c1    = request.security(syminfo.tickerid, htf_tf, close[1],                 lookahead=barmerge.lookahead_off)
+htf_c2    = request.security(syminfo.tickerid, htf_tf, close[2],                 lookahead=barmerge.lookahead_off)
+
+// HTF Bias score (mirrors Python HTFContext._compute_bias)
+htf_score   = 0.0
+htf_score  := htf_ef > htf_es ? htf_score + 0.35 : htf_ef < htf_es ? htf_score - 0.35 : htf_score
+htf_score  := htf_close > htf_ef and htf_ef > htf_es ? htf_score + 0.25 :
+              htf_close < htf_ef and htf_ef < htf_es ? htf_score - 0.25 :
+              htf_close > htf_es                     ? htf_score + 0.10 :
+              htf_close < htf_es                     ? htf_score - 0.10 : htf_score
+htf_adx_bonus = htf_adx >= 30 ? 0.20 : htf_adx >= 20 ? 0.10 : 0.0
+htf_score  := htf_score > 0 ? htf_score + htf_adx_bonus :
+              htf_score < 0 ? htf_score - htf_adx_bonus : htf_score
+htf_rising  = htf_c2 <= htf_c1 and htf_c1 <= htf_close
+htf_falling = htf_c2 >= htf_c1 and htf_c1 >= htf_close
+htf_score  := htf_rising ? htf_score + 0.10 : htf_falling ? htf_score - 0.10 : htf_score
+
+htf_score_c  = math.max(-1.0, math.min(1.0, htf_score))
+htf_bias     = htf_score_c >= 0.35 ? 1 : htf_score_c <= -0.35 ? -1 : 0
+htf_strength = math.abs(htf_score_c)
+
+htf_conf_mod(dir) =>
+    if htf_bias == 0
+        0.0
+    else
+        _aligned = (dir == "LONG" and htf_bias == 1) or (dir == "SHORT" and htf_bias == -1)
+        if _aligned
+            htf_strength >= 0.6 ? 0.15 : 0.05
+        else
+            htf_strength >= 0.6 ? -0.35 : -0.20
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5M LTF DATA
+// ─────────────────────────────────────────────────────────────────────────────
+ltf_ema9        = request.security(syminfo.tickerid, ltf_tf, ta.ema(close, 9),  lookahead=barmerge.lookahead_off)
+ltf_ema21       = request.security(syminfo.tickerid, ltf_tf, ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+ltf_close       = request.security(syminfo.tickerid, ltf_tf, close,             lookahead=barmerge.lookahead_off)
+ltf_open        = request.security(syminfo.tickerid, ltf_tf, open,              lookahead=barmerge.lookahead_off)
+ltf_is_green    = ltf_close > ltf_open
+ltf_pb_dist_pct = ltf_ema9 > 0 ? math.abs(close - ltf_ema9) / close * 100 : 999.0
+ltf_at_ema9     = ltf_pb_dist_pct < 0.15
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIDENCE SCORING (mirrors Python _compute_confidence)
+// ─────────────────────────────────────────────────────────────────────────────
+compute_conf(dir) =>
+    sc = 0.0
+    // Factor 1: ADX strength (+0.20)
+    sc := adx_val >= adx_strong ? sc + 0.20 : adx_val >= 30 ? sc + 0.10 : sc
+    // Factor 2: Pullback tightness (+0.20)
+    pb_atr_d = atr14 > 0 ? math.abs(close - ema_f_line) / atr14 : 999.0
+    sc := pb_atr_d <= 0.5 ? sc + 0.20 : pb_atr_d <= 1.0 ? sc + 0.10 : sc
+    // Factor 3: MACD histogram accelerating (+0.15)
+    if dir == "LONG" and macd_hist > 0 and macd_hist > macd_hist[1]
+        sc := sc + 0.15
+    else if dir == "SHORT" and macd_hist < 0 and macd_hist < macd_hist[1]
+        sc := sc + 0.15
+    else if (dir == "LONG" and macd_hist > 0) or (dir == "SHORT" and macd_hist < 0)
+        sc := sc + 0.05
+    // Factor 4: Candle body strength (+0.15)
+    _body  = math.abs(close - open)
+    _rng   = high - low
+    _ratio = _rng > 0 ? _body / _rng : 0.0
+    sc := _ratio >= 0.60 ? sc + 0.15 : _ratio >= 0.40 ? sc + 0.07 : sc
+    // Factor 5: EMA fast slope alignment (+0.15)
+    if dir == "LONG" and ema_f_slope > 0
+        sc := sc + 0.15
+    else if dir == "SHORT" and ema_f_slope < 0
+        sc := sc + 0.15
+    // Factor 6: Volume confirmation (+0.15)
+    sc := vol_ratio >= 1.2 ? sc + 0.15 : vol_ratio >= 0.8 ? sc + 0.05 : sc
+    math.min(sc, 1.0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETUP CONDITIONS (mirrors Python on_bar entry logic)
+// ─────────────────────────────────────────────────────────────────────────────
+pb_zone    = math.abs(close - ema_f_line) < atr14 * pb_tol_atr
+sl_rising  = ema_s_slope > 0
+sl_falling = ema_s_slope < 0
+p_above    = close > ema_s_line
+p_below    = close < ema_s_line
+m_bull     = macd_line > macd_sig_line
+m_bear     = macd_line < macd_sig_line
+c_bull_bar = close > open
+c_bear_bar = close < open
+adx_ok     = adx_val >= adx_min
+
+long_base  = adx_ok and sl_rising  and p_above and m_bull and pb_zone and c_bull_bar
+short_base = adx_ok and sl_falling and p_below and m_bear and pb_zone and c_bear_bar and allow_short
+
+raw_conf_l = long_base  ? compute_conf("LONG")  : 0.0
+raw_conf_s = short_base ? compute_conf("SHORT") : 0.0
+conf_long  = math.max(0.0, math.min(1.0, raw_conf_l + htf_conf_mod("LONG")))
+conf_short = math.max(0.0, math.min(1.0, raw_conf_s + htf_conf_mod("SHORT")))
+htf_mod_l  = htf_conf_mod("LONG")
+htf_mod_s  = htf_conf_mod("SHORT")
+
+long_signal  = long_base  and conf_long  >= min_conf
+short_signal = short_base and conf_short >= min_conf
+
+get_tier(c) => c >= 0.65 ? "A" : c >= 0.40 ? "B" : "C"
+tier_long  = get_tier(conf_long)
+tier_short = get_tier(conf_short)
+
+// Tier details (mirrors Python _get_tier_params)
+get_size_mult(c) => c >= 0.65 ? 2.0 : c >= 0.40 ? 1.5 : 0.5
+get_tp1_close_pct(c) => c >= 0.65 ? 0.33 : c >= 0.40 ? 0.50 : 0.70
+
+// ── Cooldown between signals ────────────────────────────────────────────────
+var int last_long_bar  = -999
+var int last_short_bar = -999
+
+long_trigger_raw  = long_signal  and not long_signal[1]
+short_trigger_raw = short_signal and not short_signal[1]
+
+long_trigger  = long_trigger_raw  and (bar_index - last_long_bar)  >= sig_cooldown
+short_trigger = short_trigger_raw and (bar_index - last_short_bar) >= sig_cooldown
+
+if long_trigger
+    last_long_bar  := bar_index
+if short_trigger
+    last_short_bar := bar_index
+
+// Session (mirrors Python _get_session_mult)
+utc_h     = hour(time, "UTC")
+is_us     = utc_h >= 14 and utc_h < 21
+is_eu     = utc_h >= 8  and utc_h < 14
+sess_name = is_us ? "US 1.0x" : is_eu ? "EU 0.75x" : "Off 0.5x"
+sess_mult = is_us ? 1.0 : is_eu ? 0.75 : 0.50
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYNC 1: SL with swing structure + ATR clamp
+// (mirrors Python _find_swing_level + _compute_sl)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Find last confirmed swing pivot in lookback window.
+// LONG: last Higher Low (local min with `w` bars each side confirming)
+// SHORT: last Lower High (local max with `w` bars each side confirming)
+// Returns [level, found] where found=true if a real pivot was detected.
+find_swing(dir, lookback, w) =>
+    _found = false
+    _level = 0.0
+    // Need at least 2*w bars of history to confirm a pivot with w bars each side.
+    // bar_index is 0-based, so we need bar_index >= 2*w.
+    _lb = math.min(lookback, bar_index)
+    if _lb > 2 * w  // enough bars to form at least one pivot candidate
+        if dir == "LONG"
+            for i = w to _lb - w
+                _is_pivot = true
+                for j = 1 to w
+                    // i+j: bars further back (older) — safe since i+j <= _lb <= bar_index
+                    // i-j: bars more recent — must stay >= 0 (not future)
+                    if i - j < 0
+                        _is_pivot := false
+                        break
+                    if low[i] > low[i - j] or low[i] > low[i + j]
+                        _is_pivot := false
+                        break
+                if _is_pivot
+                    _level := low[i]
+                    _found := true
+                    break
+        else
+            for i = w to _lb - w
+                _is_pivot = true
+                for j = 1 to w
+                    if i - j < 0
+                        _is_pivot := false
+                        break
+                    if high[i] < high[i - j] or high[i] < high[i + j]
+                        _is_pivot := false
+                        break
+                if _is_pivot
+                    _level := high[i]
+                    _found := true
+                    break
+    [_level, _found]
+
+// Compute SL price using swing structure + ATR clamp
+// (mirrors Python _compute_sl exactly)
+calc_sl(dir, conf) =>
+    _lb = math.min(sl_swing_lookback, bar_index)
+    [_swing, _swing_found] = find_swing(dir, sl_swing_lookback, sl_swing_window)
+    _method = _swing_found ? "swing" : "lookback"
+
+    if dir == "LONG"
+        // Fallback: lookback low if no swing found
+        _fallback = ta.lowest(low, _lb > 0 ? _lb : 1)
+        _base = _swing_found ? _swing : _fallback
+        // Take more protective of [swing, ema_slow]
+        _struct_sl = math.min(_base, ema_s_line) - atr14 * sl_buf_atr
+        _dist = close - _struct_sl
+        // Clamp to [min_atr, max_atr] range
+        _dist := math.max(_dist, atr14 * sl_min_atr)
+        _dist := math.min(_dist, atr14 * sl_max_atr)
+        _sl = close - _dist
+        _risk = math.abs(close - _sl)
+        // TP per tier
+        _rr1 = conf >= 0.65 ? tp1_r_A : conf >= 0.40 ? tp1_r_B : tp1_r_C
+        _rr2 = conf >= 0.65 ? tp2_r_A : conf >= 0.40 ? tp2_r_B : tp2_r_C
+        _tp1 = close + _risk * _rr1
+        _tp2 = close + _risk * _rr2
+        [_sl, _tp1, _tp2, _method]
+    else
+        _fallback = ta.highest(high, _lb > 0 ? _lb : 1)
+        _base = _swing_found ? _swing : _fallback
+        _struct_sl = math.max(_base, ema_s_line) + atr14 * sl_buf_atr
+        _dist = _struct_sl - close
+        _dist := math.max(_dist, atr14 * sl_min_atr)
+        _dist := math.min(_dist, atr14 * sl_max_atr)
+        _sl = close + _dist
+        _risk = math.abs(close - _sl)
+        _rr1 = conf >= 0.65 ? tp1_r_A : conf >= 0.40 ? tp1_r_B : tp1_r_C
+        _rr2 = conf >= 0.65 ? tp2_r_A : conf >= 0.40 ? tp2_r_B : tp2_r_C
+        _tp1 = close - _risk * _rr1
+        _tp2 = close - _risk * _rr2
+        [_sl, _tp1, _tp2, _method]
+
+[sl_l, tp1_l, tp2_l, sl_method_l] = calc_sl("LONG",  conf_long)
+[sl_s, tp1_s, tp2_s, sl_method_s] = calc_sl("SHORT", conf_short)
+
+active_long  = long_signal
+active_short = short_signal
+act_sl   = active_long ? sl_l  : active_short ? sl_s  : na
+act_risk = not na(act_sl) ? math.abs(close - act_sl) : 0.0
+act_sl_method = active_long ? sl_method_l : active_short ? sl_method_s : "—"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTS — EMAs
+// ─────────────────────────────────────────────────────────────────────────────
+plot(ema_f_line, "EMA20",     color=color.new(C_AMBER, 0), linewidth=1)
+plot(ema_s_line, "EMA50",     color=color.new(C_BLUE,  0), linewidth=2)
+
+htf_vis = timeframe.in_seconds() <= 14400
+plot(show_htf_ema and htf_vis ? htf_ef : na, "EMA50 4H",  color=color.new(C_BULL, 25), linewidth=2, style=plot.style_circles)
+plot(show_htf_ema and htf_vis ? htf_es : na, "EMA200 4H", color=color.new(C_BEAR, 25), linewidth=2, style=plot.style_circles)
+
+ltf_vis = timeframe.in_seconds() <= 900
+plot(show_ltf_ema and ltf_vis ? ltf_ema9  : na, "EMA9 5M",  color=color.new(#D4537E, 45), linewidth=1, style=plot.style_stepline)
+plot(show_ltf_ema and ltf_vis ? ltf_ema21 : na, "EMA21 5M", color=color.new(#D4537E, 70), linewidth=1, style=plot.style_stepline)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BACKGROUNDS
+// ─────────────────────────────────────────────────────────────────────────────
+bgcolor(show_session and is_us ? C_BG_US   : na, title="Sesión US")
+bgcolor(show_session and is_eu ? C_BG_EU   : na, title="Sesión EU")
+bgcolor(show_htf_bg and htf_bias ==  1 ? C_BG_BULL : na, title="4H Bull")
+bgcolor(show_htf_bg and htf_bias == -1 ? C_BG_BEAR : na, title="4H Bear")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADX LABEL — solo en el último bar
+// ─────────────────────────────────────────────────────────────────────────────
+var label adx_lbl_obj = na
+
+if show_adx_lbl and barstate.islast
+    label.delete(adx_lbl_obj)
+    _filled = math.round(math.min(adx_val / adx_strong * 10, 10))
+    _bar_str = ""
+    for i = 0 to _filled - 1
+        _bar_str := _bar_str + "█"
+    for i = 0 to 9 - _filled
+        _bar_str := _bar_str + "·"
+    _adx_txt = "ADX " + str.tostring(math.round(adx_val, 1)) + " [" + _bar_str + "]" +
+               (adx_val >= adx_strong ? " ★" : adx_val >= adx_min ? " ✓" : " ✗")
+    _adx_col = adx_val >= adx_strong ? C_BULL : adx_val >= adx_min ? C_AMBER : C_NEUT
+    adx_lbl_obj := label.new(bar_index, high, _adx_txt,
+                              color=color.new(_adx_col, 85),
+                              textcolor=_adx_col,
+                              style=label.style_label_down,
+                              size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL LABELS + BOXES
+// ─────────────────────────────────────────────────────────────────────────────
+var label lbl_long  = na
+var label lbl_short = na
+var box   bx_sl_l   = na
+var box   bx_tp1_l  = na
+var box   bx_tp2_l  = na
+var line  ln_sl_l   = na
+var line  ln_tp1_l  = na
+var line  ln_tp2_l  = na
+var box   bx_sl_s   = na
+var box   bx_tp1_s  = na
+var box   bx_tp2_s  = na
+var line  ln_sl_s   = na
+var line  ln_tp1_s  = na
+var line  ln_tp2_s  = na
+
+plotshape(show_signals and long_trigger,  "LONG",  shape.triangleup,   location.belowbar, C_BULL, size=size.small)
+plotshape(show_signals and short_trigger, "SHORT", shape.triangledown, location.abovebar, C_BEAR, size=size.small)
+
+if show_signals and long_trigger
+    label.delete(lbl_long)
+    _htf_tag = htf_bias == 1 ? "↑4H" : htf_bias == -1 ? "↓4H!" : "~4H"
+    _mod_tag = htf_mod_l >= 0 ? "+" + str.tostring(math.round(htf_mod_l * 100)) + "%" : str.tostring(math.round(htf_mod_l * 100)) + "%"
+    _sess    = is_us ? "US" : is_eu ? "EU" : "off"
+    _sz      = str.tostring(math.round(get_size_mult(conf_long), 1)) + "x"
+    _tp1c    = str.tostring(math.round(get_tp1_close_pct(conf_long) * 100)) + "%"
+    _txt = "▲ LONG  T" + tier_long + " " + _sz + "  c=" + str.tostring(math.round(conf_long * 100)) + "% (htf" + _mod_tag + ")\n" +
+           _htf_tag + "  " + _sess + "  ADX=" + str.tostring(math.round(adx_val, 1)) + "  SL:" + sl_method_l + "\n" +
+           "SL=" + str.tostring(math.round(sl_l, 2)) + "  TP1=" + str.tostring(math.round(tp1_l, 2)) + " (" + _tp1c + ")"
+    lbl_long := label.new(bar_index, low * 0.9998, _txt,
+                          color=color.new(C_BULL, 5), textcolor=color.white,
+                          style=label.style_label_up, size=size.small)
+
+if show_signals and short_trigger
+    label.delete(lbl_short)
+    _htf_tag = htf_bias == -1 ? "↓4H" : htf_bias == 1 ? "↑4H!" : "~4H"
+    _mod_tag = htf_mod_s >= 0 ? "+" + str.tostring(math.round(htf_mod_s * 100)) + "%" : str.tostring(math.round(htf_mod_s * 100)) + "%"
+    _sess    = is_us ? "US" : is_eu ? "EU" : "off"
+    _sz      = str.tostring(math.round(get_size_mult(conf_short), 1)) + "x"
+    _tp1c    = str.tostring(math.round(get_tp1_close_pct(conf_short) * 100)) + "%"
+    _txt = "▼ SHORT  T" + tier_short + " " + _sz + "  c=" + str.tostring(math.round(conf_short * 100)) + "% (htf" + _mod_tag + ")\n" +
+           _htf_tag + "  " + _sess + "  ADX=" + str.tostring(math.round(adx_val, 1)) + "  SL:" + sl_method_s + "\n" +
+           "SL=" + str.tostring(math.round(sl_s, 2)) + "  TP1=" + str.tostring(math.round(tp1_s, 2)) + " (" + _tp1c + ")"
+    lbl_short := label.new(bar_index, high * 1.0002, _txt,
+                           color=color.new(C_BEAR, 5), textcolor=color.white,
+                           style=label.style_label_down, size=size.small)
+
+// Boxes — SL / TP zones
+if show_sl_tp and long_trigger
+    box.delete(bx_sl_l)
+    box.delete(bx_tp1_l)
+    box.delete(bx_tp2_l)
+    line.delete(ln_sl_l)
+    line.delete(ln_tp1_l)
+    line.delete(ln_tp2_l)
+    _ext = bar_index + box_bars
+    bx_sl_l   := box.new(bar_index, close, _ext, sl_l,   border_color=color.new(C_BEAR, 55), bgcolor=color.new(C_BEAR, 88))
+    bx_tp1_l  := box.new(bar_index, close, _ext, tp1_l,  border_color=color.new(C_BLUE, 55), bgcolor=color.new(C_BLUE, 90))
+    bx_tp2_l  := box.new(bar_index, tp1_l, _ext, tp2_l,  border_color=color.new(C_BULL, 55), bgcolor=color.new(C_BULL, 90))
+    ln_sl_l   := line.new(bar_index, sl_l,  _ext + 5, sl_l,  color=C_BEAR, width=1, style=line.style_dashed)
+    ln_tp1_l  := line.new(bar_index, tp1_l, _ext + 5, tp1_l, color=C_BLUE, width=1, style=line.style_dashed)
+    ln_tp2_l  := line.new(bar_index, tp2_l, _ext + 5, tp2_l, color=C_BULL, width=1, style=line.style_dashed)
+
+if show_sl_tp and short_trigger
+    box.delete(bx_sl_s)
+    box.delete(bx_tp1_s)
+    box.delete(bx_tp2_s)
+    line.delete(ln_sl_s)
+    line.delete(ln_tp1_s)
+    line.delete(ln_tp2_s)
+    _ext = bar_index + box_bars
+    bx_sl_s   := box.new(bar_index, sl_s,  _ext, close,  border_color=color.new(C_BULL, 55), bgcolor=color.new(C_BEAR, 88))
+    bx_tp1_s  := box.new(bar_index, tp1_s, _ext, close,  border_color=color.new(C_BLUE, 55), bgcolor=color.new(C_BLUE, 90))
+    bx_tp2_s  := box.new(bar_index, tp2_s, _ext, tp1_s,  border_color=color.new(C_BULL, 55), bgcolor=color.new(C_BULL, 90))
+    ln_sl_s   := line.new(bar_index, sl_s,  _ext + 5, sl_s,  color=C_BULL, width=1, style=line.style_dashed)
+    ln_tp1_s  := line.new(bar_index, tp1_s, _ext + 5, tp1_s, color=C_BLUE, width=1, style=line.style_dashed)
+    ln_tp2_s  := line.new(bar_index, tp2_s, _ext + 5, tp2_s, color=C_BULL, width=1, style=line.style_dashed)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INFO PANEL
+// ─────────────────────────────────────────────────────────────────────────────
+var table pan = table.new(position.top_right, 2, 24,
+                           bgcolor=C_PANEL_BG,
+                           border_color=color.new(color.white, 75),
+                           border_width=1,
+                           frame_color=color.new(color.white, 65),
+                           frame_width=1)
+
+f_cell(col, row, txt, bg, tc) =>
+    table.cell(pan, col, row, txt, text_color=tc, text_size=size.small, bgcolor=bg, text_halign=text.align_left)
+
+f_cell_r(col, row, txt, bg, tc) =>
+    table.cell(pan, col, row, txt, text_color=tc, text_size=size.small, bgcolor=bg, text_halign=text.align_right)
+
+f_sep(row, txt) =>
+    table.cell(pan, 0, row, txt, text_color=color.new(color.white, 35), text_size=size.tiny,
+               text_halign=text.align_center, bgcolor=color.new(#1a1a2e, 0))
+
+fmt(v) =>
+    if math.abs(v) >= 10000
+        str.tostring(math.round(v))
+    else if math.abs(v) >= 100
+        str.tostring(math.round(v, 1))
+    else if math.abs(v) >= 1
+        str.tostring(math.round(v, 2))
+    else
+        str.tostring(math.round(v, 4))
+
+if show_panel and barstate.islast
+
+    // Row 0: Header
+    table.cell(pan, 0, 0, "TrendBot MTF v4  " + syminfo.ticker,
+               text_color=color.white, text_size=size.small,
+               text_halign=text.align_center,
+               bgcolor=color.new(#1a1a2e, 0))
+
+    // Row 1: Countdown
+    f_cell(0,  1, "Próxima vela",   C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 1, countdown_str + "  [" + timeframe.period + "]", C_CELL_DIM, color.white)
+
+    // ── 4H ───────────────────────────────────────────────────────────────────
+    f_sep(2, "── 4H BIAS ──")
+
+    _htf_lbl = htf_bias == 1 ? "▲ ALCISTA" : htf_bias == -1 ? "▼ BAJISTA" : "◆ NEUTRAL"
+    _htf_bg  = htf_bias == 1 ? C_OK : htf_bias == -1 ? C_BAD : C_MID
+    f_cell(0,  3, "Bias 4H",     C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 3, _htf_lbl, _htf_bg, color.white)
+
+    _hf = math.round(math.min(htf_strength * 10, 10))
+    _hbar = ""
+    for i = 0 to _hf - 1
+        _hbar := _hbar + "█"
+    for i = 0 to 9 - _hf
+        _hbar := _hbar + "·"
+    f_cell(0,  4, "Fuerza 4H",   C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 4, _hbar + " " + str.tostring(math.round(htf_strength * 100)) + "%",
+             htf_strength >= 0.6 ? C_OK : htf_strength >= 0.35 ? C_WARN : C_MID, color.white)
+
+    f_cell(0,  5, "4H EMA50/200", C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 5, fmt(htf_ef) + " / " + fmt(htf_es),
+             htf_ef > htf_es ? color.new(C_BULL, 55) : color.new(C_BEAR, 55), color.white)
+
+    _ha = math.round(math.min(htf_adx / 35 * 10, 10))
+    _habar = ""
+    for i = 0 to _ha - 1
+        _habar := _habar + "█"
+    for i = 0 to 9 - _ha
+        _habar := _habar + "·"
+    f_cell(0,  6, "ADX 4H",      C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 6, fmt(htf_adx) + " [" + _habar + "]",
+             htf_adx >= 30 ? C_OK : htf_adx >= 20 ? C_WARN : C_MID, color.white)
+
+    // ── 15M ──────────────────────────────────────────────────────────────────
+    f_sep(7, "── 15M SETUP ──")
+
+    _af = math.round(math.min(adx_val / adx_strong * 10, 10))
+    _abar = ""
+    for i = 0 to _af - 1
+        _abar := _abar + "█"
+    for i = 0 to 9 - _af
+        _abar := _abar + "·"
+    _astar = adx_val >= adx_strong ? " ★" : adx_val >= adx_min ? " ✓" : " ✗"
+    f_cell(0,  8, "ADX 15M",     C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 8, fmt(adx_val) + _astar + " [" + _abar + "]",
+             adx_val >= adx_strong ? C_OK : adx_val >= adx_min ? C_WARN : C_MID, color.white)
+
+    _pb_now = atr14 > 0 ? math.abs(close - ema_f_line) / atr14 : 0.0
+    f_cell(0,  9, "Pullback EMA20", C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 9, str.tostring(math.round(_pb_now, 2)) + " ATR  " + (pb_zone ? "✓ zona" : "✗ lejos"),
+             pb_zone ? C_OK : C_MID, color.white)
+
+    _mbull = macd_line > macd_sig_line
+    _macc  = macd_hist > macd_hist[1] ? " acel" : macd_hist < macd_hist[1] ? " desacel" : " estable"
+    f_cell(0,  10, "MACD",        C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 10, (_mbull ? "▲ alcista" : "▼ bajista") + _macc,
+             _mbull ? C_OK : C_BAD, color.white)
+
+    f_cell(0,  11, "Volumen",     C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 11, str.tostring(math.round(vol_ratio, 2)) + "x  " + (vol_ratio >= 1.2 ? "✓ alto" : vol_ratio >= 0.8 ? "~ ok" : "✗ bajo"),
+             vol_ratio >= 1.2 ? C_OK : vol_ratio >= 0.8 ? C_WARN : C_MID, color.white)
+
+    _cc  = p_above ? conf_long  : conf_short
+    _cr  = p_above ? raw_conf_l : raw_conf_s
+    _cm  = p_above ? htf_mod_l  : htf_mod_s
+    _ct  = get_tier(_cc)
+    _cms = _cm >= 0 ? "+" : ""
+    f_cell(0,  12, "Confidence",  C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 12, str.tostring(math.round(_cc * 100)) + "%  T" + _ct + "  (b" + str.tostring(math.round(_cr * 100)) + "% h" + _cms + str.tostring(math.round(_cm * 100)) + "%)",
+             _cc >= 0.65 ? C_OK : _cc >= 0.40 ? C_WARN : C_MID, color.white)
+
+    f_cell(0,  13, "Sesión",      C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 13, sess_name,
+             is_us ? color.new(C_BLUE, 40) : is_eu ? color.new(C_AMBER, 55) : C_MID, color.white)
+
+    _stxt = long_signal ? "▲ LONG READY" : short_signal ? "▼ SHORT READY" : long_base ? "~ LONG (low conf)" : short_base ? "~ SHORT (low conf)" : "— Esperando"
+    _sbg  = long_signal ? C_OK : short_signal ? C_BAD : (long_base or short_base) ? C_WARN : C_MID
+    f_cell(0,  14, "Setup 15M",   C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 14, _stxt, _sbg, color.white)
+
+    // ── 5M ───────────────────────────────────────────────────────────────────
+    f_sep(15, "── 5M ENTRADA ──")
+
+    _lside = close >= ltf_ema9 ? "encima" : "debajo"
+    f_cell(0,  16, "5M EMA9 dist", C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 16, str.tostring(math.round(ltf_pb_dist_pct, 3)) + "%  " + _lside + (ltf_at_ema9 ? "  ★ PB!" : ""),
+             ltf_at_ema9 ? C_WARN : C_CELL_DIM, color.white)
+
+    f_cell(0,  17, "5M EMA9/21",   C_CELL_DIM, color.new(color.white, 40))
+    f_cell_r(1, 17, fmt(ltf_ema9) + " / " + fmt(ltf_ema21) + "  " + (ltf_is_green ? "▲ verde" : "▼ roja"),
+             ltf_is_green ? color.new(C_BULL, 60) : color.new(C_BEAR, 60), color.white)
+
+    // ── Niveles ───────────────────────────────────────────────────────────────
+    f_sep(18, "── NIVELES ──")
+
+    if active_long or active_short
+        _sv  = active_long ? sl_l  : sl_s
+        _t1v = active_long ? tp1_l : tp1_s
+        _t2v = active_long ? tp2_l : tp2_s
+        _sm  = active_long ? sl_method_l : sl_method_s
+        _slpct = close > 0 ? math.abs(close - _sv) / close * 100 : 0.0
+        f_cell(0,  19, "SL (" + _sm + ")", C_CELL_DIM, color.new(color.white, 40))
+        f_cell_r(1, 19, fmt(_sv) + "  (" + str.tostring(math.round(_slpct, 2)) + "%)", C_BAD, color.white)
+        f_cell(0,  20, "TP1 / TP2",  C_CELL_DIM, color.new(color.white, 40))
+        f_cell_r(1, 20, fmt(_t1v) + " / " + fmt(_t2v), C_OK, color.white)
+        _atr_pct = close > 0 ? math.round(atr14 / close * 100, 3) : 0.0
+        _sl_atr_dist = atr14 > 0 ? math.round(math.abs(close - _sv) / atr14, 2) : 0.0
+        f_cell(0,  21, "ATR / R",    C_CELL_DIM, color.new(color.white, 40))
+        f_cell_r(1, 21, fmt(atr14) + " (" + str.tostring(_atr_pct) + "%)  SL=" + str.tostring(_sl_atr_dist) + " ATR", C_CELL_DIM, color.white)
+        // SYNC 3+4: Size mult and TP1 close pct
+        _act_conf = active_long ? conf_long : conf_short
+        _sz_m = get_size_mult(_act_conf)
+        _tp1c = get_tp1_close_pct(_act_conf) * 100
+        f_cell(0,  22, "Size / TP1%", C_CELL_DIM, color.new(color.white, 40))
+        f_cell_r(1, 22, str.tostring(math.round(_sz_m, 1)) + "x  TP1 close " + str.tostring(math.round(_tp1c)) + "%", C_CELL_DIM, color.white)
+        f_cell(0,  23, "", C_CELL_DIM, color.new(color.white, 0))
+        f_cell_r(1, 23, "", C_CELL_DIM, color.new(color.white, 0))
+    else
+        f_cell(0,  19, "SL / TP",    C_CELL_DIM, color.new(color.white, 40))
+        f_cell_r(1, 19, "— sin setup activo", C_CELL_DIM, color.new(color.white, 50))
+        _atr_pct2 = close > 0 ? math.round(atr14 / close * 100, 3) : 0.0
+        f_cell(0,  20, "ATR",        C_CELL_DIM, color.new(color.white, 40))
+        f_cell_r(1, 20, fmt(atr14) + " (" + str.tostring(_atr_pct2) + "%)", C_CELL_DIM, color.white)
+        f_cell(0,  21, "",           C_CELL_DIM, color.new(color.white, 0))
+        f_cell_r(1, 21, "",          C_CELL_DIM, color.new(color.white, 0))
+        f_cell(0,  22, "",           C_CELL_DIM, color.new(color.white, 0))
+        f_cell_r(1, 22, "",          C_CELL_DIM, color.new(color.white, 0))
+        f_cell(0,  23, "",           C_CELL_DIM, color.new(color.white, 0))
+        f_cell_r(1, 23, "",          C_CELL_DIM, color.new(color.white, 0))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(long_trigger,                          title="LONG setup",   message="{{ticker}} LONG — revisar gráfico")
+alertcondition(short_trigger,                         title="SHORT setup",  message="{{ticker}} SHORT — revisar gráfico")
+alertcondition(long_trigger or short_trigger,         title="Setup MTF",    message="{{ticker}} setup en {{interval}}")
+alertcondition(ltf_at_ema9 and (long_signal or short_signal), title="EMA9 5M", message="{{ticker}} precio en EMA9 5M con setup activo")

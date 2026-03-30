@@ -225,7 +225,7 @@ class BingXClient:
                 raise OrderNotFoundError(msg)
             if code == 100401:
                 raise AuthenticationError(msg)
-            if code == 100429:
+            if code in (100429, 100410):
                 raise RateLimitError(msg)
             raise BrokerError(f"BingX API error {code}: {msg}")
 
@@ -247,7 +247,11 @@ class BingXClient:
         for attempt, delay in enumerate(delays, start=1):
             try:
                 return await self._request(method, path, params=params, json=json, signed=signed)
-            except RateLimitError:
+            except RateLimitError as e:
+                # "disabled period" = endpoint banned; retrying makes it worse — give up fast
+                if "disabled period" in str(e):
+                    logger.warning("endpoint_disabled", path=path, error=str(e)[:120])
+                    raise
                 sleep = delay + random.uniform(0, 0.5)
                 logger.warning("rate_limit_backoff", attempt=attempt, sleep_s=sleep, path=path)
                 time.sleep(sleep)
@@ -365,7 +369,8 @@ class BingXClient:
         if price is not None:
             payload["price"] = str(price)
         if client_order_id:
-            payload["clientOrderID"] = client_order_id
+            # BingX requires alphanumeric clientOrderID (no hyphens)
+            payload["clientOrderID"] = client_order_id.replace("-", "")[:36]
         if extra:
             payload.update(extra)
 

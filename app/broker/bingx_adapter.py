@@ -71,6 +71,7 @@ class BingXAdapter(BrokerAdapter):
             qty=float(request.qty),
             price=float(request.price) if request.price else None,
             client_order_id=request.client_id,
+            extra=request.extra or None,
         )
         order = raw.get("order", raw)
         result = OrderResult(

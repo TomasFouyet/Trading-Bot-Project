@@ -135,6 +135,13 @@ class TrendFollowingStrategy(BaseStrategy):
         self._use_patience   = bool(self.params.get("use_patience",             True))
         self._soft_sl_bars   = int(self.params.get("soft_sl_bars",              48))
 
+        # ── SL structure parameters ───────────────────────────────────
+        self._sl_lookback    = int(self.params.get("sl_swing_lookback",         50))
+        self._sl_window      = int(self.params.get("sl_swing_window",           3))
+        self._sl_min_atr     = float(self.params.get("sl_min_atr",              1.0))
+        self._sl_max_atr     = float(self.params.get("sl_max_atr",              2.5))
+        self._sl_buf_atr     = float(self.params.get("sl_buffer_atr",           0.3))
+
     # ── Public: called by engine after position closes ────────────────
 
     def notify_trade_result(self, won: bool) -> None:
@@ -315,10 +322,91 @@ class TrendFollowingStrategy(BaseStrategy):
         return 1.0, "normal"
 
     # ══════════════════════════════════════════════════════════════════
+    # SL STRUCTURE HELPERS
+    # ══════════════════════════════════════════════════════════════════
+
+    def _find_swing_level(self, df: pd.DataFrame, direction: str) -> float | None:
+        """
+        Find the most recent confirmed swing pivot in the last sl_swing_lookback bars.
+        LONG → last Higher Low (local min with `window` bars on each side confirming).
+        SHORT → last Lower High (local max).
+        Scans right-to-left so it returns the most recent pivot.
+        """
+        w  = self._sl_window
+        lb = min(self._sl_lookback, len(df) - 1)
+        slice_ = df.iloc[-lb:]
+
+        if direction == "LONG":
+            vals = slice_["low"].values
+            for i in range(len(vals) - w - 1, w - 1, -1):
+                if all(vals[i] <= vals[i - j] for j in range(1, w + 1)) and \
+                   all(vals[i] <= vals[i + j] for j in range(1, w + 1)):
+                    return float(vals[i])
+        else:
+            vals = slice_["high"].values
+            for i in range(len(vals) - w - 1, w - 1, -1):
+                if all(vals[i] >= vals[i - j] for j in range(1, w + 1)) and \
+                   all(vals[i] >= vals[i + j] for j in range(1, w + 1)):
+                    return float(vals[i])
+        return None
+
+    def _compute_sl(
+        self,
+        df: pd.DataFrame,
+        close: float,
+        atr: float,
+        ema_slow: float,
+        direction: str,
+    ) -> tuple[float, str]:
+        """
+        Compute stop-loss combining swing structure + ATR clamp.
+
+        1. Find confirmed swing pivot (HL for long, LH for short).
+        2. Fall back to lookback min/max if no pivot found.
+        3. Take the more protective of [swing, ema_slow].
+        4. Add sl_buffer_atr buffer.
+        5. Clamp to [sl_min_atr, sl_max_atr] distance from close.
+        Returns (sl_price, method_str).
+        """
+        lb = min(self._sl_lookback, len(df) - 1)
+        swing = self._find_swing_level(df, direction)
+        method = "swing" if swing is not None else "lookback"
+
+        if direction == "LONG":
+            if swing is None:
+                swing = float(df["low"].iloc[-lb:].min())
+            struct_sl = min(swing, ema_slow) - atr * self._sl_buf_atr
+            dist = close - struct_sl
+            dist = max(dist, atr * self._sl_min_atr)
+            dist = min(dist, atr * self._sl_max_atr)
+            sl = close - dist
+        else:
+            if swing is None:
+                swing = float(df["high"].iloc[-lb:].max())
+            struct_sl = max(swing, ema_slow) + atr * self._sl_buf_atr
+            dist = struct_sl - close
+            dist = max(dist, atr * self._sl_min_atr)
+            dist = min(dist, atr * self._sl_max_atr)
+            sl = close + dist
+
+        return sl, method
+
+    # ══════════════════════════════════════════════════════════════════
     # MAIN SIGNAL LOGIC
     # ══════════════════════════════════════════════════════════════════
 
-    def on_bar(self, df: pd.DataFrame) -> Signal:
+    def on_bar(self, df: pd.DataFrame, htf_bias=None) -> Signal:
+        """
+        Evaluate the latest bar and return a Signal.
+
+        htf_bias: optional HTFBias object from app.strategy.mtf_context.
+                  When provided, the 4H directional bias is used to:
+                    - Boost confidence on aligned signals
+                    - Penalise confidence on opposed signals
+                    - Add htf context to signal meta for logging/Telegram
+                  When None, behaviour is identical to the original strategy
+                  (fully backwards-compatible with backtest and optimiser).
+        """
         if len(df) < self.min_bars_required:
             return _hold(self.symbol, df["ts"].iloc[-1], self.strategy_id, "warmup")
 
@@ -352,52 +440,79 @@ class TrendFollowingStrategy(BaseStrategy):
         c_bear     = float(row["close"]) < float(row["open"])
 
         if sl_rising and p_above and m_bull and pb_zone and c_bull:
-            return self._build_signal(df, row, ts, ind, atr, "LONG")
+            return self._build_signal(df, row, ts, ind, atr, "LONG", htf_bias=htf_bias)
 
         if self._allow_short and sl_falling and p_below and m_bear and pb_zone and c_bear:
-            return self._build_signal(df, row, ts, ind, atr, "SHORT")
+            return self._build_signal(df, row, ts, ind, atr, "SHORT", htf_bias=htf_bias)
 
         return _hold(self.symbol, ts, self.strategy_id, "no_setup", meta=ind)
 
     # ── Signal builder ────────────────────────────────────────────────
 
     def _build_signal(self, df: pd.DataFrame, row: pd.Series,
-                      ts, ind: dict, atr: float, direction: str) -> Signal:
+                      ts, ind: dict, atr: float, direction: str,
+                      htf_bias=None) -> Signal:
         close = float(row["close"])
 
-        # Layer 1
+        # Layer 1: Confidence scoring
         if self._use_confidence:
             conf, conf_reasons = self._compute_confidence(row, df, direction)
+
+            # ── HTF bias modifier (Layer 5) ────────────────────────────────
+            # Applied AFTER the base confidence score, before tier classification.
+            # This means HTF alignment can push a B→A trade or demote an A→B trade.
+            htf_mod    = 0.0
+            htf_label  = "htf=off"
+            htf_meta   = {}
+            if htf_bias is not None:
+                htf_mod   = htf_bias.confidence_modifier(direction)
+                conf      = round(max(0.0, min(1.0, conf + htf_mod)), 3)
+                htf_label = htf_bias.label
+                htf_meta  = {
+                    "htf_bias":      htf_bias.bias,
+                    "htf_strength":  htf_bias.strength,
+                    "htf_label":     htf_label,
+                    "htf_ema_fast":  htf_bias.ema_fast,
+                    "htf_ema_slow":  htf_bias.ema_slow,
+                    "htf_adx":       htf_bias.adx,
+                    "htf_mod":       round(htf_mod, 3),
+                    "htf_aligned":   htf_bias.is_aligned(direction),
+                }
+                if htf_mod != 0:
+                    conf_reasons.append(
+                        f"htf({'+'if htf_mod>0 else ''}{htf_mod:+.2f})"
+                    )
+
             if conf < self._min_confidence:
                 return _hold(self.symbol, ts, self.strategy_id,
-                             f"low_conf={conf:.2f}", meta=ind)
+                             f"low_conf={conf:.2f}", meta={**ind, **htf_meta})
             tier = self._get_tier_params(conf)
         else:
             conf, conf_reasons = 1.0, ["off"]
+            htf_meta  = {}
+            htf_label = "htf=off"
             tier = {"tier": "X", "size_mult": 1.0, "tp1_r": 1.5,
                     "tp2_r": 3.0, "tp1_close_pct": 0.33}
 
-        # Layer 2
+        # Layer 2: Session-aware sizing
         sess_m, sess_name = self._get_session_mult(ts)
 
-        # Layer 3
+        # Layer 3: Streak adjuster
         strk_m, strk_reason = self._get_streak_mult()
 
         # Combined sizing
         final_mult = round(max(0.10, min(tier["size_mult"] * sess_m * strk_m, 2.0)), 3)
 
         # SL / TP
-        lb = min(20, len(df) - 1)
+        sl, sl_method = self._compute_sl(df, close, atr, float(row["ema_slow"]), direction)
+        sl_atr_dist = abs(close - sl) / atr if atr > 0 else 0
+
         if direction == "LONG":
-            swing = float(df["low"].iloc[-lb:].min())
-            sl   = min(swing, float(row["ema_slow"])) - atr * 0.2
             risk = close - sl
             tp1  = close + risk * tier["tp1_r"]
             tp2  = close + risk * tier["tp2_r"]
             action = SignalAction.BUY
         else:
-            swing = float(df["high"].iloc[-lb:].max())
-            sl   = max(swing, float(row["ema_slow"])) + atr * 0.2
             risk = sl - close
             tp1  = close - risk * tier["tp1_r"]
             tp2  = close - risk * tier["tp2_r"]
@@ -406,7 +521,7 @@ class TrendFollowingStrategy(BaseStrategy):
         if risk <= 0:
             return _hold(self.symbol, ts, self.strategy_id, "zero_risk", meta=ind)
 
-        # Layer 4
+        # Layer 4: Patience timer
         soft_sl = self._soft_sl_bars if self._use_patience else 0
 
         reason = (
@@ -416,9 +531,13 @@ class TrendFollowingStrategy(BaseStrategy):
             f"|k={strk_reason}"
             f"|adx={float(row['adx']):.1f}"
         )
+        if htf_label != "htf=off":
+            reason += f"|{htf_label}"
 
         meta = {
             **ind,
+            **htf_meta,
+            "atr": round(atr, 6),
             "tp1": round(tp1, 8), "tp2": round(tp2, 8),
             "rr_tp1": tier["tp1_r"], "rr_tp2": tier["tp2_r"],
             "tp1_close_pct": tier["tp1_close_pct"],
@@ -429,6 +548,8 @@ class TrendFollowingStrategy(BaseStrategy):
             "consecutive_wins": self._consecutive_wins,
             "consecutive_losses": self._consecutive_losses,
             "soft_sl_bars": soft_sl,
+            "sl_method": sl_method,
+            "sl_atr_dist": round(sl_atr_dist, 2),
             "final_size_mult": final_mult,
             "size_breakdown": f"tier={tier['size_mult']}*sess={sess_m}*strk={strk_m}",
         }

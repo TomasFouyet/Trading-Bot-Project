@@ -44,6 +44,7 @@ from app.config import get_settings
 from app.core.exceptions import KillSwitchTriggered
 from app.core.logging import get_logger
 from app.data.parquet_store import ParquetStore
+from app.engine.position_manager import advance_bar, apply_tp1_updates, check_exit
 from app.risk.manager import RiskManager
 from app.strategy.base import BaseStrategy
 from app.strategy.signals import Signal, SignalAction
@@ -329,109 +330,45 @@ class BacktestEngine:
             # Count bars in position
             bars_in_position += len(open_trades)
 
-            # ── Automated SL/TP check ──────────────────────────────────────
+            # ── Automated SL/TP check (via shared PositionManager) ────────
             # Only runs for strategies where engine_manages_sl_tp = True.
-            # Strategies that emit their own CLOSE/PARTIAL_CLOSE (e.g.
-            # rsi_divergence) set engine_manages_sl_tp = False to avoid
-            # double-closing.
-            _default_tp1_close_pct = float(self._strategy.params.get("tp1_close_pct", 0.70))
-            _pending_pids   = {v.get("position_id") for v in pending_closes.values()}
-            _engine_sl_tp   = getattr(self._strategy, "engine_manages_sl_tp", True)
+            _pending_pids  = {v.get("position_id") for v in pending_closes.values()}
+            _engine_sl_tp  = getattr(self._strategy, "engine_manages_sl_tp", True)
+            _bh, _bl, _bc  = float(bar.high), float(bar.low), float(bar.close)
 
             for _pid in list(open_trades.keys()) if _engine_sl_tp else []:
-                # Skip trades with a pending close already queued
-                if _pid in _pending_pids:
-                    continue
-                # Skip trades that were just opened this bar (avoid same-bar trigger)
-                if _pid in _newly_opened_pids:
+                if _pid in _pending_pids or _pid in _newly_opened_pids:
                     continue
 
-                _tr     = open_trades[_pid]
-                _sl     = _tr.get("sl_price")
-                _tp1    = _tr.get("tp1_price")
-                _tp2    = _tr.get("tp2_price")
+                _tr = open_trades[_pid]
+                advance_bar(_tr, _bh, _bl)
+                _action = check_exit(_tr, _bh, _bl, _bc)
+                if _action is None:
+                    continue
+
                 _is_lng = _tr["side"] == "LONG"
-                _bh     = float(bar.high)
-                _bl     = float(bar.low)
-                _bc     = float(bar.close)
+                _req = OrderRequest(
+                    symbol=symbol,
+                    side=OrderSide.SELL if _is_lng else OrderSide.BUY,
+                    order_type=OrderType.MARKET,
+                    qty=_action.close_qty,
+                    strategy_id=self._strategy.strategy_id,
+                )
+                _ord, _ = await adapter.place_order(_req)
+                pending_closes[_ord.order_id] = {
+                    "position_id": _pid,
+                    "close_pct":   _action.close_pct,
+                    "exit_type":   _action.exit_type,
+                    "limit_price": _action.trigger_price,
+                }
+                if _action.tp1_updates:
+                    apply_tp1_updates(_tr, _action.tp1_updates)
+                logger.debug(
+                    "sl_tp_triggered",
+                    pid=_pid, exit_type=_action.exit_type,
+                    exit_px=_action.trigger_price, bar_ts=bar.ts.isoformat(),
+                )
 
-                # Layer 1: Read per-trade tp1_close_pct from signal meta (adaptive confidence)
-                _tp1_close_pct = _tr.get("tp1_close_pct", _default_tp1_close_pct)
-
-                # Layer 4: Patience timer — soft SL for first N bars
-                # During patience period, SL only triggers on bar CLOSE (not wick)
-                _tr["bars_in_trade"] = _tr.get("bars_in_trade", 0) + 1
-                _soft_sl_bars = _tr.get("soft_sl_bars", 0)
-                _in_patience = _soft_sl_bars > 0 and _tr["bars_in_trade"] <= _soft_sl_bars
-
-                _exit_px   = None
-                _exit_type = None
-                _cls_pct   = 1.0  # default: full close
-
-                if _is_lng:
-                    # SL check — use close price during patience, low price after
-                    _sl_trigger = _bc if _in_patience else _bl
-                    if _sl is not None and _sl_trigger <= _sl:
-                        _exit_px   = _sl
-                        _exit_type = "be_sl" if _tr.get("tp1_hit") else "sl"
-                    elif _tp2 is not None and _bh >= _tp2 and _tr.get("tp1_hit"):
-                        _exit_px   = _tp2
-                        _exit_type = "tp2"
-                    elif _tp1 is not None and _bh >= _tp1 and not _tr.get("tp1_hit"):
-                        _exit_px   = _tp1
-                        _exit_type = "tp1"
-                        _cls_pct   = _tp1_close_pct if _tp2 is not None else 1.0
-                else:  # SHORT
-                    _sl_trigger = _bc if _in_patience else _bh
-                    if _sl is not None and _sl_trigger >= _sl:
-                        _exit_px   = _sl
-                        _exit_type = "be_sl" if _tr.get("tp1_hit") else "sl"
-                    elif _tp2 is not None and _bl <= _tp2 and _tr.get("tp1_hit"):
-                        _exit_px   = _tp2
-                        _exit_type = "tp2"
-                    elif _tp1 is not None and _bl <= _tp1 and not _tr.get("tp1_hit"):
-                        _exit_px   = _tp1
-                        _exit_type = "tp1"
-                        _cls_pct   = _tp1_close_pct if _tp2 is not None else 1.0
-
-                if _exit_px is not None:
-                    _cls_qty = (_tr["qty"] * Decimal(str(_cls_pct))).quantize(Decimal("0.000001"))
-                    _cls_qty = min(_cls_qty, _tr["qty"])
-                    if _cls_qty > Decimal("0"):
-                        _req = OrderRequest(
-                            symbol=symbol,
-                            side=OrderSide.SELL if _is_lng else OrderSide.BUY,
-                            order_type=OrderType.MARKET,
-                            qty=_cls_qty,
-                            strategy_id=self._strategy.strategy_id,
-                        )
-                        _ord, _ = await adapter.place_order(_req)
-                        pending_closes[_ord.order_id] = {
-                            "position_id": _pid,
-                            "close_pct":   _cls_pct,
-                            "exit_type":   _exit_type,
-                            "limit_price": _exit_px,
-                        }
-                        if _exit_type == "tp1":
-                            _tr["tp1_hit"] = True
-                            _tr["tp1_price"] = None
-
-                            _entry = Decimal(str(_tr["entry_price"]))
-                            _fee_buffer = _entry * Decimal("0.002")  # 0.2%
-
-                            if _is_lng:
-                                _tr["sl_price"] = float(_entry + _fee_buffer)
-                            else:
-                                _tr["sl_price"] = float(_entry - _fee_buffer)
-
-                            _tr["soft_sl_bars"] = 0
-
-                        logger.debug(
-                            "sl_tp_triggered",
-                            pid=_pid, exit_type=_exit_type,
-                            exit_px=_exit_px, bar_ts=bar.ts.isoformat(),
-                            patience=_in_patience,
-                        )
             # 2. Build strategy window
             window_start = max(0, i + 1 - WINDOW_SIZE)
             window = bars[window_start: i + 1]
