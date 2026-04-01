@@ -251,3 +251,65 @@ def _is_breakeven(trade: dict) -> bool:
         return sl >= entry - be_threshold
     else:
         return sl <= entry + be_threshold
+
+
+def check_reversal(trade: dict, new_direction: str) -> bool:
+    """
+    Check if a new signal should trigger a reversal (close + re-open).
+
+    Returns True if:
+      - There IS an open trade
+      - The new signal is in the OPPOSITE direction
+      - The trade hasn't already hit TP1 (trailing — let it ride)
+
+    When True, the caller should:
+      1. Close the current position at market
+      2. Immediately open in `new_direction` using the new signal's SL/TP
+    """
+    if trade is None:
+        return False
+
+    current_side = trade["side"]
+    opposite = (
+        (current_side == "LONG"  and new_direction == "SHORT") or
+        (current_side == "SHORT" and new_direction == "LONG")
+    )
+
+    if not opposite:
+        return False
+
+    # Don't reverse if TP1 was already hit — we're trailing and the original
+    # direction might still be profitable.
+    if trade.get("tp1_hit", False):
+        return False
+
+    return True
+
+
+def compute_reversal_savings(trade: dict, current_price: float) -> dict:
+    """
+    Compute how much a reversal saves vs waiting for SL.
+
+    Returns dict with:
+      - sl_price: the current SL level
+      - unrealised_pnl: current P&L at market price
+      - sl_pnl: P&L if SL hits
+      - savings: unrealised - sl_pnl (positive = reversal is better)
+    """
+    entry = float(trade["entry_price"])
+    sl    = float(trade.get("sl_price", entry))
+    il    = trade["side"] == "LONG"
+
+    if il:
+        unrealised = current_price - entry
+        sl_pnl     = sl - entry
+    else:
+        unrealised = entry - current_price
+        sl_pnl     = entry - sl
+
+    return {
+        "sl_price":       sl,
+        "unrealised_pnl": unrealised,
+        "sl_pnl":         sl_pnl,
+        "savings":        unrealised - sl_pnl,
+    }

@@ -575,6 +575,13 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
             _print_bar_line(symbol, bar, sig, meta, open_trade, float(equity), params)
 
             # ── 5. Signal routing ─────────────────────────────────────────────
+            #
+            # REVERSAL SWAP: split into 5a (close if opposite) + 5b (open).
+            # When a signal fires in the opposite direction of an open trade,
+            # step 5a closes the position and step 5b immediately re-opens
+            # in the new direction — all on the same bar. This avoids eating
+            # a full SL loss when the trend has clearly reversed.
+            #
             if not sig.is_actionable():
                 continue
             ok, reason = risk.validate_signal(sig, equity)
@@ -588,9 +595,71 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
             tk    = await adapter.get_ticker(symbol)
             price = Decimal(str(tk["last"]))
 
-            if not open_trade:
-                # ── Open new position ─────────────────────────────────────────
-                if sig.action in (SignalAction.BUY, SignalAction.SELL):
+            # ── 5a. Reversal close: if in trade and signal is opposite, close first ──
+            if open_trade:
+                is_long  = open_trade["side"] == "LONG"
+                should_close = (
+                    sig.action == SignalAction.CLOSE
+                    or (is_long      and sig.action == SignalAction.SELL)
+                    or (not is_long  and sig.action == SignalAction.BUY)
+                )
+                if should_close:
+                    close_side     = OrderSide.SELL if is_long else OrderSide.BUY
+                    close_pos_side = "LONG"          if is_long else "SHORT"
+                    if not is_live:
+                        fill = _make_paper_fill(open_trade, float(bar.close),
+                                                open_trade["qty"], close_side)
+                    else:
+                        try:
+                            _, fill = await adapter.place_order(OrderRequest(
+                                symbol=symbol, side=close_side,
+                                order_type=OrderType.MARKET,
+                                qty=open_trade["qty"],
+                                strategy_id=strategy.strategy_id,
+                                extra={"positionSide": close_pos_side},
+                            ))
+                        except Exception as ce:
+                            print(f"  [{s}] ⚠️  Reversal close failed: {ce}")
+                            fill = None
+
+                    if fill:
+                        is_reversal = sig.action in (SignalAction.BUY, SignalAction.SELL)
+                        exit_type = "reversal_swap" if is_reversal else "signal_close"
+                        tp = _record_close(open_trade, fill, exit_type)
+                        risk.record_fill(tp)
+                        state["wins" if tp > 0 else "losses"] += 1
+                        label = "WIN" if tp > 0 else "LOSS"
+                        if hasattr(strategy, "notify_trade_result"):
+                            strategy.notify_trade_result(won=tp > 0)
+                        w, l = state["wins"], state["losses"]
+                        new_dir = "LONG" if sig.action == SignalAction.BUY else "SHORT"
+                        swap_tag = f" → SWAP to {new_dir}" if is_reversal else ""
+                        print(
+                            f"\n  ┌{'─'*60}┐"
+                            f"\n  │  TRADE CLOSED [{s}] [{label}]  ({exit_type})"
+                            f"\n  │  {open_trade['side']} @ ${float(fill.price):,.2f}"
+                            f"\n  │  pnl=${float(tp):+.2f}{swap_tag}"
+                            f"\n  └{'─'*60}┘\n"
+                        )
+                        if notifier:
+                            asyncio.create_task(notifier.trade_closed(
+                                symbol=symbol, side=open_trade["side"],
+                                exit_type=exit_type, exit_price=float(fill.price),
+                                entry_price=float(open_trade["entry_price"]),
+                                total_pnl=float(tp), qty=float(open_trade["original_qty"]),
+                                total_trades=w + l, wins=w, losses=l,
+                            ))
+                        open_trade = None
+                        state["positions"].pop(symbol, None)
+                        # open_trade is now None → step 5b will immediately re-open
+                    else:
+                        continue  # close failed — retry next bar
+                else:
+                    # Same-direction signal while in trade — ignore
+                    continue
+
+            # ── 5b. Open new position (also fires after reversal swap) ────────
+            if not open_trade and sig.action in (SignalAction.BUY, SignalAction.SELL):
                     il  = sig.action == SignalAction.BUY
                     bq  = risk.compute_order_qty(sig, equity, price)
                     max_notional = equity * Decimal(str(args.alloc_pct)) / Decimal("100")
@@ -720,60 +789,7 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                                 reason=sig.reason, equity=float(equity),
                             ))
 
-            else:
-                # ── Signal-based close / reversal ─────────────────────────────
-                is_long  = open_trade["side"] == "LONG"
-                should_close = (
-                    sig.action == SignalAction.CLOSE
-                    or (is_long      and sig.action == SignalAction.SELL)
-                    or (not is_long  and sig.action == SignalAction.BUY)
-                )
-                if should_close:
-                    close_side     = OrderSide.SELL if is_long else OrderSide.BUY
-                    close_pos_side = "LONG"          if is_long else "SHORT"
-                    if not is_live:
-                        # Paper mode: synthetic fill at current bar close
-                        fill = _make_paper_fill(open_trade, bc := float(bar.close),
-                                                open_trade["qty"], close_side)
-                    else:
-                        try:
-                            _, fill = await adapter.place_order(OrderRequest(
-                                symbol=symbol, side=close_side,
-                                order_type=OrderType.MARKET,
-                                qty=open_trade["qty"],
-                                strategy_id=strategy.strategy_id,
-                                extra={"positionSide": close_pos_side},
-                            ))
-                        except Exception as ce:
-                            print(f"  [{s}] ⚠️  Signal close failed: {ce}")
-                            fill = None
-
-                    if fill:
-                        exit_type = "signal_close" if sig.action == SignalAction.CLOSE else "reversal_close"
-                        tp = _record_close(open_trade, fill, exit_type)
-                        risk.record_fill(tp)
-                        state["wins" if tp > 0 else "losses"] += 1
-                        label = "WIN" if tp > 0 else "LOSS"
-                        if hasattr(strategy, "notify_trade_result"):
-                            strategy.notify_trade_result(won=tp > 0)
-                        w, l = state["wins"], state["losses"]
-                        print(
-                            f"\n  ┌{'─'*60}┐"
-                            f"\n  │  TRADE CLOSED [{s}] [{label}]  ({exit_type})"
-                            f"\n  │  {open_trade['side']} @ ${float(fill.price):,.2f}"
-                            f"\n  │  pnl=${float(tp):+.2f}"
-                            f"\n  └{'─'*60}┘\n"
-                        )
-                        if notifier:
-                            asyncio.create_task(notifier.trade_closed(
-                                symbol=symbol, side=open_trade["side"],
-                                exit_type=exit_type, exit_price=float(fill.price),
-                                entry_price=float(open_trade["entry_price"]),
-                                total_pnl=float(tp), qty=float(open_trade["original_qty"]),
-                                total_trades=w + l, wins=w, losses=l,
-                            ))
-                        open_trade = None
-                        state["positions"].pop(symbol, None)
+            # (old else block removed — reversal logic now in step 5a above)
 
     except asyncio.CancelledError:
         pass
