@@ -78,12 +78,21 @@ HTF_TIMEFRAME = "4h"   # Higher timeframe for bias
 LTF_TIMEFRAME = "5m"   # Lower timeframe for entry precision
 
 BEST_PARAMS: dict = {
-    "adx_min": 20, "adx_strong": 35, "min_confidence": 0,
-    "pullback_tolerance_atr": 1, "session_mult_eu": 0.75,
-    "session_mult_other": 0.5, "soft_sl_bars": 48,
-    "streak_euphoria_mult": 0.75, "use_confidence": True,
-    "use_patience": True, "use_session_filter": True, "use_streak_adj": True,
+    # Core — aligned with Pine Script defaults
+    "adx_min": 20, "adx_strong": 35,
+    "pullback_tolerance_atr": 1.0,
     "allow_short": True,
+    # Confidence — min_confidence=0 matches Pine (no tier-C filter)
+    "min_confidence": 0, "use_confidence": True,
+    # Session sizing
+    "session_mult_us": 1.0, "session_mult_eu": 0.75, "session_mult_other": 0.5,
+    "use_session_filter": True,
+    # Streak
+    "streak_euphoria_mult": 0.75, "use_streak_adj": True,
+    # Patience (SL suave)
+    "soft_sl_bars": 48, "use_patience": True,
+    # Cooldown (mirrors Pine Script sig_cooldown=5 barras)
+    "sig_cooldown": 5,
 }
 
 DEFAULT_BASES = ["BTC", "ETH", "SOL", "XRP", "BNB"]
@@ -289,6 +298,17 @@ def _analyze_bar(bar, sig, meta: dict, params: dict) -> tuple[str, bool]:
     if reason == "zero_risk":
         return "SL too close (0 risk)", False
 
+    # Cooldown: setup valid but waiting for bar gap to expire
+    if reason.startswith("cooldown_long("):
+        try: bars_left = reason.split("(")[1].rstrip("bars)")
+        except: bars_left = "?"
+        return f"★ COOLDOWN LONG — setup ready, {bars_left} bars remaining", True
+
+    if reason.startswith("cooldown_short("):
+        try: bars_left = reason.split("(")[1].rstrip("bars)")
+        except: bars_left = "?"
+        return f"★ COOLDOWN SHORT — setup ready, {bars_left} bars remaining", True
+
     return reason, False
 
 
@@ -364,6 +384,79 @@ async def _status_loop(client, state, symbols, shutdown_event):
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=STATUS_SECS)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Daily Telegram summary (fires at midnight UTC)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _daily_summary_loop(state, args, shutdown_event):
+    """
+    Fires a Telegram daily_summary once per UTC day at midnight.
+    Tracks session-start equity per day so the daily PnL is correct
+    even across multi-day sessions.
+    """
+    from app.notify.telegram import TelegramNotifier
+    daily_start_equity = state.get("equity", args.balance)
+    daily_wins:   int = 0
+    daily_losses: int = 0
+    top_pnl:   float = 0.0
+    worst_pnl: float = 0.0
+
+    last_day = datetime.now(timezone.utc).date()
+    state["_daily_start_equity"] = daily_start_equity
+    state["_daily_wins"]   = daily_wins
+    state["_daily_losses"] = daily_losses
+    state["_daily_top"]    = top_pnl
+    state["_daily_worst"]  = worst_pnl
+
+    # Wait until just after next midnight UTC
+    while not shutdown_event.is_set():
+        now     = datetime.now(timezone.utc)
+        today   = now.date()
+
+        # Check if a new day started since last loop
+        if today > last_day:
+            notifier = state.get("notifier")
+            eq       = state.get("equity", args.balance)
+            dse      = state.get("_daily_start_equity", args.balance)
+            dw       = state.get("_daily_wins",   0)
+            dl       = state.get("_daily_losses", 0)
+            dt       = state.get("_daily_top",    0.0)
+            dwo      = state.get("_daily_worst",  0.0)
+
+            if notifier:
+                try:
+                    await notifier.daily_summary(
+                        equity=eq,
+                        starting_equity=dse,
+                        total_trades=dw + dl,
+                        wins=dw,
+                        losses=dl,
+                        top_pnl=dt,
+                        worst_pnl=dwo,
+                    )
+                except Exception as _e:
+                    print(f"  [daily_summary] Telegram error: {_e}")
+
+            # Reset counters for the new day
+            state["_daily_start_equity"] = eq
+            state["_daily_wins"]   = 0
+            state["_daily_losses"] = 0
+            state["_daily_top"]    = 0.0
+            state["_daily_worst"]  = 0.0
+            last_day = today
+
+        # Sleep until 30s after next midnight UTC
+        tomorrow = datetime(today.year, today.month, today.day,
+                            tzinfo=timezone.utc) + __import__("datetime").timedelta(days=1)
+        secs_until_midnight = (tomorrow - now).total_seconds() + 30
+        secs_to_wait = min(secs_until_midnight, 300)  # check at most every 5 min
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=secs_to_wait)
             break
         except asyncio.TimeoutError:
             pass
@@ -483,11 +576,64 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                         ))
                     state["positions"][symbol] = open_trade
 
-                    # Edge case: TP1 consumed entire qty (e.g. cp=1.0)
+                    # Edge case: TP1 consumed entire qty (e.g. cp=1.0).
+                    # total_partial_pnl already holds np_ from line above,
+                    # so we must NOT call _record_close (it would recompute and
+                    # double-count the same leg). Write CSV directly instead.
                     if open_trade["qty"] < Decimal("0.001"):
-                        tp = _record_close(open_trade, fill, et)
+                        tp = open_trade["total_partial_pnl"]
+                        n  = open_trade["entry_price"] * open_trade["original_qty"]
+                        _append_csv({
+                            "trade_id": open_trade["trade_id"],
+                            "symbol":   open_trade["symbol"],
+                            "side":     open_trade["side"],
+                            "strategy": open_trade["strategy"],
+                            "tier":     open_trade["tier"],
+                            "leverage": open_trade["leverage"],
+                            "entry_time":  open_trade["entry_time"],
+                            "entry_price": float(open_trade["entry_price"]),
+                            "exit_time":   fill.timestamp.isoformat(),
+                            "exit_price":  float(fill.price),
+                            "exit_type":   et,
+                            "qty":     float(open_trade["original_qty"]),
+                            "pnl":     float(tp.quantize(Decimal("0.01"))),
+                            "pnl_pct": round(float(tp / n * 100) if n else 0, 4),
+                            "fees":    float(open_trade["total_partial_fees"].quantize(Decimal("0.01"))),
+                            "signal_reason": open_trade["signal_reason"],
+                        })
                         risk.record_fill(tp)
                         state["wins" if tp > 0 else "losses"] += 1
+                        # Update daily counters for Telegram daily_summary
+                        _pnl_f = float(tp)
+                        if tp > 0: state["_daily_wins"]   = state.get("_daily_wins",   0) + 1
+                        else:      state["_daily_losses"] = state.get("_daily_losses", 0) + 1
+                        state["_daily_top"]   = max(state.get("_daily_top",   0.0), _pnl_f)
+                        state["_daily_worst"] = min(state.get("_daily_worst", 0.0), _pnl_f)
+                        # Notify Telegram — full close at TP1
+                        w, l = state["wins"], state["losses"]; tt = w + l
+                        if notifier:
+                            asyncio.create_task(notifier.trade_closed(
+                                symbol=symbol, side=open_trade["side"], exit_type="tp1",
+                                exit_price=float(fill.price),
+                                entry_price=float(open_trade["entry_price"]),
+                                total_pnl=float(tp), qty=float(open_trade["original_qty"]),
+                                total_trades=tt, wins=w, losses=l,
+                            ))
+                        if hasattr(strategy, "notify_trade_result"):
+                            strategy.notify_trade_result(won=tp > 0)
+                        if hasattr(strategy, "_bar_index"):
+                            if open_trade["side"] == "LONG":
+                                strategy._last_long_bar = -999
+                            else:
+                                strategy._last_short_bar = -999
+                        # Update equity immediately after close
+                        try:
+                            balances = await adapter.get_balance()
+                            equity   = balances[0].total if balances else equity
+                            state["_balance_cache"] = (equity, time.monotonic())
+                            state["equity"] = float(equity)
+                        except Exception:
+                            pass
                         open_trade = None
                         state["positions"].pop(symbol, None)
 
@@ -496,6 +642,12 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                     tp = _record_close(open_trade, fill, et)
                     risk.record_fill(tp)
                     state["wins" if tp > 0 else "losses"] += 1
+                    # Update daily counters for Telegram daily_summary
+                    _pnl_f = float(tp)
+                    if tp > 0: state["_daily_wins"]   = state.get("_daily_wins",   0) + 1
+                    else:      state["_daily_losses"] = state.get("_daily_losses", 0) + 1
+                    state["_daily_top"]   = max(state.get("_daily_top",   0.0), _pnl_f)
+                    state["_daily_worst"] = min(state.get("_daily_worst", 0.0), _pnl_f)
                     w, l = state["wins"], state["losses"]; tt = w + l
                     label = "WIN" if tp > 0 else "LOSS"
                     print(
@@ -513,6 +665,25 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                         ))
                     if hasattr(strategy, "notify_trade_result"):
                         strategy.notify_trade_result(won=tp > 0)
+                    # Reset cooldown for the direction just closed so the strategy
+                    # can fire again immediately on the next valid bar — avoids an
+                    # artificial wait after SL/TP closes, matching Pine behaviour.
+                    if hasattr(strategy, "_bar_index"):
+                        closed_side = open_trade["side"]
+                        if closed_side == "LONG":
+                            strategy._last_long_bar = -999
+                        else:
+                            strategy._last_short_bar = -999
+                    # Refresh equity immediately so the next bar uses the correct
+                    # post-close balance for position sizing (avoids 60s cache lag).
+                    try:
+                        balances = await adapter.get_balance()
+                        equity   = balances[0].total if balances else equity
+                        async with state["_balance_lock"]:
+                            state["_balance_cache"] = (equity, time.monotonic())
+                        state["equity"] = float(equity)
+                    except Exception:
+                        pass
                     open_trade = None
                     state["positions"].pop(symbol, None)
 
@@ -628,6 +799,12 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                         tp = _record_close(open_trade, fill, exit_type)
                         risk.record_fill(tp)
                         state["wins" if tp > 0 else "losses"] += 1
+                        # Update daily counters for Telegram daily_summary
+                        _pnl_f = float(tp)
+                        if tp > 0: state["_daily_wins"]   = state.get("_daily_wins",   0) + 1
+                        else:      state["_daily_losses"] = state.get("_daily_losses", 0) + 1
+                        state["_daily_top"]   = max(state.get("_daily_top",   0.0), _pnl_f)
+                        state["_daily_worst"] = min(state.get("_daily_worst", 0.0), _pnl_f)
                         label = "WIN" if tp > 0 else "LOSS"
                         if hasattr(strategy, "notify_trade_result"):
                             strategy.notify_trade_result(won=tp > 0)
@@ -651,6 +828,26 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                             ))
                         open_trade = None
                         state["positions"].pop(symbol, None)
+                        # Reset cooldown so step 5b fires immediately on this bar —
+                        # mirrors Pine Script reversal swap (cierra + reabre en la
+                        # misma barra sin esperar el cooldown de la nueva dirección).
+                        if is_reversal and hasattr(strategy, "_bar_index"):
+                            if sig.action == SignalAction.BUY:
+                                strategy._last_long_bar = -999
+                            else:
+                                strategy._last_short_bar = -999
+                        # Bug 2 fix: refresh equity immediately after reversal close
+                        # so step 5b uses the correct post-close balance for sizing,
+                        # not the stale 60s cache.
+                        try:
+                            balances = await adapter.get_balance()
+                            equity   = balances[0].total if balances else equity
+                            async with state["_balance_lock"]:
+                                state["_balance_cache"] = (equity, time.monotonic())
+                            state["equity"] = float(equity)
+                            price = Decimal(str((await adapter.get_ticker(symbol))["last"]))
+                        except Exception:
+                            pass
                         # open_trade is now None → step 5b will immediately re-open
                     else:
                         continue  # close failed — retry next bar
@@ -951,8 +1148,14 @@ async def main(args):
         "positions": {},
         "sym_states": {},
         "notifier":  notifier,
-        "_balance_cache": None,
-        "_balance_lock":  asyncio.Lock(),
+        "_balance_cache":     None,
+        "_balance_lock":      asyncio.Lock(),
+        # Daily summary counters (updated by every trade close, read by _daily_summary_loop)
+        "_daily_start_equity": args.balance,
+        "_daily_wins":    0,
+        "_daily_losses":  0,
+        "_daily_top":     0.0,
+        "_daily_worst":   0.0,
     }
 
     for sym in symbols:
@@ -966,6 +1169,11 @@ async def main(args):
         _status_loop(client, state, symbols, shutdown_event)
     )
     worker_tasks.append(status_task)
+
+    daily_task = asyncio.create_task(
+        _daily_summary_loop(state, args, shutdown_event)
+    )
+    worker_tasks.append(daily_task)
 
     results = await asyncio.gather(*worker_tasks, return_exceptions=True)
     for i, r in enumerate(results):

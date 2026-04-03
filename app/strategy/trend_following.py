@@ -112,7 +112,7 @@ class TrendFollowingStrategy(BaseStrategy):
         self._use_confidence = bool(self.params.get("use_confidence",           True))
         self._adx_strong     = float(self.params.get("adx_strong",             35.0))
         self._tight_pb_atr   = float(self.params.get("tight_pb_atr",            0.5))
-        self._min_confidence = float(self.params.get("min_confidence",           0.40))
+        self._min_confidence = float(self.params.get("min_confidence",            0.0))
 
         # ── Layer 2: Session-aware sizing ─────────────────────────────
         self._use_session    = bool(self.params.get("use_session_filter",       True))
@@ -134,6 +134,14 @@ class TrendFollowingStrategy(BaseStrategy):
         # ── Layer 4: Patience timer ───────────────────────────────────
         self._use_patience   = bool(self.params.get("use_patience",             True))
         self._soft_sl_bars   = int(self.params.get("soft_sl_bars",              48))
+
+        # ── Signal cooldown (mirrors Pine Script sig_cooldown) ────────
+        # Pine uses edge detection (signal AND NOT signal[1]) + bar cooldown.
+        # Prevents re-firing on every consecutive bar of the same setup.
+        self._sig_cooldown       = int(self.params.get("sig_cooldown", 5))
+        self._last_long_bar:  int = -999
+        self._last_short_bar: int = -999
+        self._bar_index:      int = 0   # incremented every on_bar() call
 
         # ── SL structure parameters ───────────────────────────────────
         self._sl_lookback    = int(self.params.get("sl_swing_lookback",         50))
@@ -406,7 +414,14 @@ class TrendFollowingStrategy(BaseStrategy):
                     - Add htf context to signal meta for logging/Telegram
                   When None, behaviour is identical to the original strategy
                   (fully backwards-compatible with backtest and optimiser).
+
+        Cooldown (mirrors Pine Script sig_cooldown):
+          A signal only fires when sig_cooldown bars have elapsed since the last
+          signal in that direction. This prevents re-firing on every consecutive
+          bar of the same setup — matching Pine's edge-detection behaviour.
         """
+        self._bar_index += 1
+
         if len(df) < self.min_bars_required:
             return _hold(self.symbol, df["ts"].iloc[-1], self.strategy_id, "warmup")
 
@@ -439,11 +454,36 @@ class TrendFollowingStrategy(BaseStrategy):
         c_bull     = float(row["close"]) > float(row["open"])
         c_bear     = float(row["close"]) < float(row["open"])
 
-        if sl_rising and p_above and m_bull and pb_zone and c_bull:
-            return self._build_signal(df, row, ts, ind, atr, "LONG", htf_bias=htf_bias)
+        long_setup  = sl_rising  and p_above and m_bull and pb_zone and c_bull
+        short_setup = sl_falling and p_below and m_bear and pb_zone and c_bear
 
-        if self._allow_short and sl_falling and p_below and m_bear and pb_zone and c_bear:
-            return self._build_signal(df, row, ts, ind, atr, "SHORT", htf_bias=htf_bias)
+        # ── Cooldown gate (mirrors Pine Script sig_cooldown) ──────────
+        # Only fire if at least sig_cooldown bars have elapsed since the
+        # last signal in that direction.
+        long_ok  = long_setup  and (self._bar_index - self._last_long_bar)  >= self._sig_cooldown
+        short_ok = short_setup and (self._bar_index - self._last_short_bar) >= self._sig_cooldown
+
+        if long_ok:
+            sig = self._build_signal(df, row, ts, ind, atr, "LONG", htf_bias=htf_bias)
+            if sig.is_actionable():
+                self._last_long_bar = self._bar_index
+            return sig
+
+        if self._allow_short and short_ok:
+            sig = self._build_signal(df, row, ts, ind, atr, "SHORT", htf_bias=htf_bias)
+            if sig.is_actionable():
+                self._last_short_bar = self._bar_index
+            return sig
+
+        # Setup exists but blocked by cooldown → inform watchlist display
+        if long_setup and not long_ok:
+            bars_left = self._sig_cooldown - (self._bar_index - self._last_long_bar)
+            return _hold(self.symbol, ts, self.strategy_id,
+                         f"cooldown_long({bars_left}bars)", meta=ind)
+        if short_setup and not short_ok:
+            bars_left = self._sig_cooldown - (self._bar_index - self._last_short_bar)
+            return _hold(self.symbol, ts, self.strategy_id,
+                         f"cooldown_short({bars_left}bars)", meta=ind)
 
         return _hold(self.symbol, ts, self.strategy_id, "no_setup", meta=ind)
 

@@ -91,6 +91,9 @@ class TelegramNotifier:
         tp1_pct = abs(tp1 - entry_price) / entry_price * 100 if tp1 else 0
         tp2_pct = abs(tp2 - entry_price) / entry_price * 100 if tp2 else 0
         notional = entry_price * qty
+        sl_str  = f"${stop_loss:,.2f}  (-{sl_pct:.1f}%)" if stop_loss else "—"
+        tp1_str = f"${tp1:,.2f}  (+{tp1_pct:.1f}%)"      if tp1       else "—"
+        tp2_str = f"${tp2:,.2f}  (+{tp2_pct:.1f}%)"      if tp2       else "—"
 
         msg = (
             f"{direction_emoji} <b>TRADE OPENED</b>\n"
@@ -100,9 +103,9 @@ class TelegramNotifier:
             f"💵 Entry:      <code>${entry_price:,.2f}</code>\n"
             f"📦 Qty:        <code>{qty:.4f}  (${notional:,.2f} notional)</code>\n"
             f"\n"
-            f"🛡 Stop Loss:  <code>${stop_loss:,.2f}  (-{sl_pct:.1f}%)</code>\n"
-            f"🎯 TP1:        <code>${tp1:,.2f}  (+{tp1_pct:.1f}%)</code>\n"
-            f"🏆 TP2:        <code>${tp2:,.2f}  (+{tp2_pct:.1f}%)</code>\n"
+            f"🛡 Stop Loss:  <code>{sl_str}</code>\n"
+            f"🎯 TP1:        <code>{tp1_str}</code>\n"
+            f"🏆 TP2:        <code>{tp2_str}</code>\n"
         )
         if session:
             msg += f"🕐 Session:    {session}\n"
@@ -153,11 +156,13 @@ class TelegramNotifier:
     ) -> bool:
         # Emoji & label by exit type
         labels = {
-            "tp2":          ("🏆", "TP2 HIT"),
-            "sl":           ("🔴", "STOP LOSS HIT"),
-            "be_sl":        ("🟡", "BREAKEVEN STOP"),
-            "signal_close": ("⚪", "SIGNAL CLOSE"),
-            "shutdown":     ("⛔", "SHUTDOWN CLOSE"),
+            "tp2":           ("🏆", "TP2 HIT"),
+            "sl":            ("🔴", "STOP LOSS HIT"),
+            "be_sl":         ("🟡", "BREAKEVEN STOP"),
+            "trailing_sl":   ("🔶", "TRAILING STOP HIT"),
+            "reversal_swap": ("🔄", "REVERSAL SWAP"),
+            "signal_close":  ("⚪", "SIGNAL CLOSE"),
+            "shutdown":      ("⛔", "SHUTDOWN CLOSE"),
         }
         emoji, label = labels.get(exit_type, ("⚪", exit_type.upper()))
 
