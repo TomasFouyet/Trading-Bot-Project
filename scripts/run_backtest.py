@@ -90,7 +90,7 @@ async def main(args: argparse.Namespace) -> None:
             "allow_short":   args.allow_short,
             "swing_lookback": args.swing_lookback,
         }
-    elif args.strategy == "trend_following":
+    elif args.strategy in ("trend_following", "trend_following_v2"):
         strategy_params = {
             # Core
             "adx_min":               args.adx_min,
@@ -116,9 +116,15 @@ async def main(args: argparse.Namespace) -> None:
             "use_streak_adj":        args.tf_use_streak,
             "streak_euphoria_after": args.tf_streak_after,
             "streak_euphoria_mult":  args.tf_streak_mult,
-            # Layer 4: Patience
+            # Layer 4: Patience (SL triggers on wick — keep disabled)
             "use_patience":          args.tf_use_patience,
             "soft_sl_bars":          args.tf_soft_sl_bars,
+            # ATR-based SL + price floor
+            "sl_min_atr":            args.sl_min_atr,
+            "sl_max_atr":            args.sl_max_atr,
+            "sl_min_pct":            args.sl_min_pct,
+            # Reversal swap
+            "enable_reversal":       not args.no_reversal,
         }
     elif args.strategy == "event_driven":
         strategy_params = {
@@ -154,6 +160,8 @@ async def main(args: argparse.Namespace) -> None:
         commission_rate=Decimal(str(args.commission_bps)) / 10000,
         slippage_rate=Decimal(str(args.slippage_bps)) / 10000,
         verbose=bool(args.output),
+        leverage=args.leverage,
+        max_daily_drawdown_pct=Decimal(str(args.max_dd)),
     )
 
     result = await engine.run(args.symbol, args.timeframe, start, end, strategy_params,
@@ -185,16 +193,21 @@ async def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a trading strategy backtest")
     parser.add_argument("--symbol", default="BTC-USDT")
-    parser.add_argument("--timeframe", default="5m")
-    parser.add_argument("--start", default="2025-11-20")
-    parser.add_argument("--end", default="2026-03-06")
-    parser.add_argument("--balance", type=float, default=10000.0)
-    parser.add_argument("--strategy", default="ema_cross",
+    parser.add_argument("--timeframe", default="15m")
+    parser.add_argument("--start", default="2025-05-18")
+    parser.add_argument("--end", default="2026-03-31")
+    parser.add_argument("--balance", type=float, default=500.0)
+    parser.add_argument("--strategy", default="trend_following_v2",
                         choices=["ema_cross", "rsi_divergence", "hybrid_rsi_pivot",
-                                 "mean_reversion", "trend_following", "event_driven"],
+                                 "mean_reversion", "trend_following", "trend_following_v2",
+                                 "event_driven"],
                         help="Strategy to backtest")
     parser.add_argument("--commission-bps", type=float, default=7.5, dest="commission_bps")
     parser.add_argument("--slippage-bps", type=float, default=5.0, dest="slippage_bps")
+    parser.add_argument("--leverage", type=int, default=10,
+                        help="Futures leverage (default: 10)")
+    parser.add_argument("--max-dd", type=float, default=100.0, dest="max_dd",
+                        help="Max daily drawdown %% kill switch (default: 100 = disabled for backtests)")
     parser.add_argument("--output", default=None, help="Save full JSON report to file")
 
     # EMA Cross params
@@ -324,13 +337,23 @@ if __name__ == "__main__":
                         help="Size multiplier after win streak (default: 0.75)")
 
     # ── Trend Following: Layer 4 — Patience Timer ──────────────────────────
-    parser.add_argument("--tf-use-patience", action="store_true", default=True,
+    parser.add_argument("--tf-use-patience", action="store_true", default=False,
                         dest="tf_use_patience",
                         help="Enable soft SL patience timer (Layer 4)")
     parser.add_argument("--tf-no-patience", action="store_false", dest="tf_use_patience",
                         help="Disable patience timer")
-    parser.add_argument("--tf-soft-sl-bars", type=int, default=48, dest="tf_soft_sl_bars",
-                        help="Bars for soft SL (close-only, default: 48 = 12h at 15min)")
+    parser.add_argument("--tf-soft-sl-bars", type=int, default=0, dest="tf_soft_sl_bars",
+                        help="Bars for soft SL (0 = SL triggers on wick, default: 0)")
+
+    # ── Trend Following: ATR-based SL range ────────────────────────────────
+    parser.add_argument("--sl-min-atr", type=float, default=1.5, dest="sl_min_atr",
+                        help="Minimum SL distance in ATRs (default: 1.5)")
+    parser.add_argument("--sl-max-atr", type=float, default=3.0, dest="sl_max_atr",
+                        help="Maximum SL distance in ATRs (default: 3.0)")
+    parser.add_argument("--sl-min-pct", type=float, default=0.015, dest="sl_min_pct",
+                        help="Minimum SL distance as fraction of price, floor for gap risk (default: 0.015 = 1.5%%)")
+    parser.add_argument("--no-reversal", action="store_true", default=False, dest="no_reversal",
+                        help="Disable reversal swap (open opposite position on signal flip)")
 
     # ── Event Driven params ────────────────────────────────────────────────────
     parser.add_argument("--vol-multiplier", type=float, default=2.0, dest="vol_multiplier",

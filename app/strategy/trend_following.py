@@ -133,7 +133,7 @@ class TrendFollowingStrategy(BaseStrategy):
 
         # ── Layer 4: Patience timer ───────────────────────────────────
         self._use_patience   = bool(self.params.get("use_patience",             True))
-        self._soft_sl_bars   = int(self.params.get("soft_sl_bars",              48))
+        self._soft_sl_bars   = int(self.params.get("soft_sl_bars",               0))
 
         # ── Signal cooldown (mirrors Pine Script sig_cooldown) ────────
         # Pine uses edge detection (signal AND NOT signal[1]) + bar cooldown.
@@ -146,8 +146,8 @@ class TrendFollowingStrategy(BaseStrategy):
         # ── SL structure parameters ───────────────────────────────────
         self._sl_lookback    = int(self.params.get("sl_swing_lookback",         50))
         self._sl_window      = int(self.params.get("sl_swing_window",           3))
-        self._sl_min_atr     = float(self.params.get("sl_min_atr",              1.0))
-        self._sl_max_atr     = float(self.params.get("sl_max_atr",              2.5))
+        self._sl_min_atr     = float(self.params.get("sl_min_atr",              1.5))
+        self._sl_max_atr     = float(self.params.get("sl_max_atr",              3.0))
         self._sl_buf_atr     = float(self.params.get("sl_buffer_atr",           0.3))
 
     # ── Public: called by engine after position closes ────────────────
@@ -541,7 +541,7 @@ class TrendFollowingStrategy(BaseStrategy):
         strk_m, strk_reason = self._get_streak_mult()
 
         # Combined sizing
-        final_mult = round(max(0.10, min(tier["size_mult"] * sess_m * strk_m, 2.0)), 3)
+        final_mult = round(max(0.10, min(tier["size_mult"] * sess_m * strk_m, 1.5)), 3)
 
         # SL / TP
         sl, sl_method = self._compute_sl(df, close, atr, float(row["ema_slow"]), direction)

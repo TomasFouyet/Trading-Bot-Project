@@ -134,6 +134,7 @@ class BacktestEngine:
         max_daily_drawdown_pct: Decimal | None = None,
         use_limit_orders: bool = True,
         limit_order_max_bars: int = 2,
+        leverage: int = 1,
     ) -> None:
         self._strategy = strategy
         self._store = store
@@ -143,7 +144,8 @@ class BacktestEngine:
         self._slippage = slippage_rate or _settings.slippage_rate
         self._use_limit_orders = use_limit_orders
         self._limit_order_max_bars = limit_order_max_bars
-        self._risk = RiskManager(max_daily_drawdown_pct=max_daily_drawdown_pct)
+        self._leverage = leverage
+        self._risk = RiskManager(max_daily_drawdown_pct=max_daily_drawdown_pct, leverage=leverage)
         self._verbose = verbose
 
     async def run(
@@ -198,6 +200,7 @@ class BacktestEngine:
             commission_rate=self._commission,
             maker_commission_rate=self._maker_commission,
             slippage_rate=self._slippage,
+            leverage=self._leverage,
         )
         self._risk.initialize(self._initial_balance, as_of_date=bars[0].ts.date())
 
@@ -442,17 +445,25 @@ class BacktestEngine:
                     "meta": {**merged_meta, **position_meta},  # position_meta overrides to ensure accuracy
                 })
 
-            # 4. Risk + equity
+            # 4. Risk + equity (futures model: free_cash + margin_locked + unrealized PnL)
+            # The adapter deducted margin from balance on entry; we must add it back
+            # so that equity doesn't appear to drop by the margin amount at each trade open.
+            # equity = (balance - sum(margins)) + sum(margins + unrealized_PnL)
+            #        = balance + sum(unrealized_PnL)  — but margin = notional / leverage
             balances = await adapter.get_balance()
             cash = balances[0].total if balances else self._initial_balance
             equity = cash
             for pid, trade in open_trades.items():
                 pos_qty = trade["qty"]
+                entry_px = trade["entry_price"]
                 is_long = trade["side"] == "LONG"
-                if is_long:
-                    equity += pos_qty * bar.close
-                else:
-                    equity -= pos_qty * bar.close
+                # Margin that was deducted from cash at entry
+                margin_locked = entry_px * pos_qty / Decimal(str(self._leverage))
+                unrealized = (
+                    (bar.close - entry_px) * pos_qty if is_long
+                    else (entry_px - bar.close) * pos_qty
+                )
+                equity += margin_locked + unrealized
 
             kill_switch_active = False
             try:

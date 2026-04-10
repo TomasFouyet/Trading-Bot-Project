@@ -48,26 +48,28 @@ TRADES_HEADER = [
 ]
 
 BEST_PARAMS: dict = {
+    # ── Entrada (igual que Pine Script) ──────────────────────────────────────
     "adx_min": 20, "adx_strong": 35,
     "pullback_tolerance_atr": 1.0,
     "allow_short": True,
-    "min_confidence": 0,
+    "min_confidence": 0.30,   # solo señales Tier B/A (≥0.30 conf) — filtra ruido
     "sig_cooldown": 5,
     "enable_reversal": True,
-    # SL structure
+    # ── SL — mínimo 1.5 ATR + 1.5% precio para absorber gap risk con leverage ─
     "sl_swing_lookback": 50, "sl_swing_window": 3,
-    "sl_min_atr": 1.0, "sl_max_atr": 2.5, "sl_buffer_atr": 0.3,
-    # TP per tier
+    "sl_min_atr": 1.5, "sl_max_atr": 3.0, "sl_buffer_atr": 0.3,
+    "sl_min_pct": 0.015,   # SL >= 1.5% del precio — protección contra brechas
+    # ── TP por tier (idéntico a Pine Script) ──────────────────────────────────
     "tp1_r_A": 1.5, "tp2_r_A": 3.0,
     "tp1_r_B": 1.5, "tp2_r_B": 2.5,
     "tp1_r_C": 1.0, "tp2_r_C": 1.5,
-    # Session
-    "session_mult_us": 1.0, "session_mult_eu": 0.75, "session_mult_other": 0.5,
-    "use_session_filter": True,
-    # Streak
-    "streak_euphoria_mult": 0.75, "use_streak_adj": True,
-    # Patience
-    "soft_sl_bars": 48, "use_patience": True,
+    # ── Sesión: DESACTIVADO para igualar Pine Script ──────────────────────────
+    # Pine Script no ajusta tamaño por sesión — usamos los mismos pesos aquí
+    "use_session_filter": False,
+    # ── Streak adjuster: DESACTIVADO — Pine Script no lo usa ─────────────────
+    "use_streak_adj": False,
+    # ── Patience: DESACTIVADO — SL se activa con la mecha igual que BingX ────
+    "soft_sl_bars": 0, "use_patience": False,
 }
 
 COMMISSION_RATE = Decimal("0.00075")
@@ -274,6 +276,13 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                             continue
 
                     if fill:
+                        # Cancel exchange SL order (position closed by bot)
+                        if is_live and open_trade.get("sl_order_id"):
+                            try:
+                                await client.cancel_order(open_trade["sl_order_id"], symbol)
+                            except Exception:
+                                pass  # order may already be gone
+
                         pnl = _calc_pnl(open_trade, fill)
                         _log_trade(open_trade, fill, exit_type, pnl, strategy)
                         state["wins" if pnl > 0 else "losses"] += 1
@@ -380,9 +389,9 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                     tier = sig.meta.get("confidence_tier", "X")
                     lev  = tier_lev.get(tier, 1)
                     bq   = risk.compute_order_qty(sig, equity, price)
-                    max_notional = equity * Decimal(str(args.alloc_pct)) / Decimal("100")
-                    mq   = (max_notional / price).quantize(Decimal("0.001"))
-                    qty  = min(bq * lev, mq).quantize(Decimal("0.001"))
+                    max_margin = equity * Decimal(str(args.alloc_pct)) / Decimal("100")
+                    max_qty_by_margin = (max_margin * Decimal(str(lev))) / price
+                    qty  = min(bq, max_qty_by_margin).quantize(Decimal("0.001"))
                     if qty < Decimal("0.001"):
                         continue
 
@@ -420,8 +429,27 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                             "leverage": lev,
                             "entry_time": fill.timestamp.isoformat(),
                             "signal_reason": sig.reason,
+                            "sl_order_id": None,
                         }
                         state["positions"][symbol] = open_trade
+
+                        # Place hard stop-loss on exchange (crash protection)
+                        if is_live and sl and sl > 0:
+                            try:
+                                sl_side = "SELL" if il else "BUY"
+                                sl_resp = await client.place_stop_order(
+                                    symbol=symbol,
+                                    side=sl_side,
+                                    stop_price=float(sl),
+                                    qty=float(fill.qty),
+                                    pos_side=pos_side,
+                                    client_order_id=f"sl{open_trade['trade_id']}",
+                                )
+                                sl_order_id = (sl_resp or {}).get("orderId") or (sl_resp or {}).get("order", {}).get("orderId")
+                                open_trade["sl_order_id"] = sl_order_id
+                                print(f"  [{s}] SL order placed @ ${float(sl):,.2f}  id={sl_order_id}")
+                            except Exception as e:
+                                print(f"  [{s}] WARNING: SL order failed: {e}")
 
                         notional = float(qty) * float(fill.price)
                         print(
@@ -729,12 +757,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="TrendBot V2 — Pine Script aligned")
     p.add_argument("--symbols",       nargs="+", default=DEFAULT_BASES)
     p.add_argument("--timeframe",     default="15m")
-    p.add_argument("--balance",       type=float, default=10000.0)
+    p.add_argument("--balance",       type=float, default=500.0)
     p.add_argument("--max-positions", type=int,   default=3,    dest="max_positions")
-    p.add_argument("--alloc-pct",     type=float, default=10.0, dest="alloc_pct")
-    p.add_argument("--lev-a",  type=int, default=5, dest="lev_a")
-    p.add_argument("--lev-b",  type=int, default=3, dest="lev_b")
-    p.add_argument("--lev-c",  type=int, default=1, dest="lev_c")
+    p.add_argument("--alloc-pct",     type=float, default=20.0, dest="alloc_pct")
+    p.add_argument("--lev-a",  type=int, default=5,  dest="lev_a")
+    p.add_argument("--lev-b",  type=int, default=3,  dest="lev_b")
+    p.add_argument("--lev-c",  type=int, default=2,  dest="lev_c")
     p.add_argument("--params-file", default=None, dest="params_file")
     p.add_argument("--check",      action="store_true")
     p.add_argument("--live-bingx", action="store_true", dest="live_bingx")

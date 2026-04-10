@@ -19,9 +19,11 @@ from decimal import Decimal
 from typing import Any
 
 
-# ── Commission & breakeven constants ─────────────────────────────────────────
-COMMISSION_RATE = Decimal("0.00075")   # per-leg (entry + exit each pay this)
-BE_BUFFER       = Decimal("0.0002")    # extra 2 bps above fees
+# ── Commission & breakeven constants (derived from config) ───────────────────
+from app.config import get_settings as _get_settings
+_s = _get_settings()
+COMMISSION_RATE = _s.commission_bps / Decimal("10000")       # e.g. 7.5 bps → 0.00075
+BE_BUFFER       = _s.maker_commission_bps / Decimal("10000") # e.g. 2.0 bps → 0.0002
 
 
 @dataclass

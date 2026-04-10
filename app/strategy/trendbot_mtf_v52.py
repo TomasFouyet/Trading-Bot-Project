@@ -114,8 +114,8 @@ class TrendBotMTFv52Strategy(BaseStrategy):
         # ── SL / TP ──────────────────────────────────────────────────────────
         self._sl_lookback  = int(self.params.get("sl_swing_lookback", 50))
         self._sl_window    = int(self.params.get("sl_swing_window",   3))
-        self._sl_min_atr   = float(self.params.get("sl_min_atr",      1.2))
-        self._sl_max_atr   = float(self.params.get("sl_max_atr",      2.5))
+        self._sl_min_atr   = float(self.params.get("sl_min_atr",      1.5))
+        self._sl_max_atr   = float(self.params.get("sl_max_atr",      3.0))
         self._sl_buf_atr   = float(self.params.get("sl_buf_atr",      0.3))
 
         # TP R-multiples por tier
@@ -692,7 +692,7 @@ class TrendBotMTFv52Strategy(BaseStrategy):
         # Expressed as a multiplier for the signal confidence field
         # The run script uses sig.confidence as the equity fraction
         # So we encode: confidence = (tier_pct/100) * session_mult
-        final_mult = round(max(0.05, min(2.0, (size_pct / 100.0) * sess_m)), 4)
+        final_mult = round(max(0.05, min(1.5, (size_pct / 100.0) * sess_m)), 4)
 
         tp1_close_pct = self._tp1_close_pct[tier]
         htf_label     = htf.get("label", "4H NEUTRAL")

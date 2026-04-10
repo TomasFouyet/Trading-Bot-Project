@@ -60,12 +60,12 @@ class Settings(BaseSettings):
     bot_mode: BotMode = BotMode.PAPER
     default_symbol: str = "BTC-USDT"
     default_timeframe: str = "5m"
-    leverage: int = Field(default=5, ge=1, le=125)  # 1 = no leverage
+    leverage: int = Field(default=5, ge=1, le=125)
 
     # ── Risk manager ────────────────────────────────────────
-    risk_max_daily_drawdown_pct: Decimal = Decimal("50.0")
-    risk_max_position_pct: Decimal = Decimal("100")  # notional cap; risk-based sizing controls real exposure
-    risk_max_trade_risk_pct: Decimal = Decimal("3.0")   # % of equity risked per trade (SL-based)
+    risk_max_daily_drawdown_pct: Decimal = Decimal("5.0")   # kill switch diario
+    risk_max_position_pct: Decimal = Decimal("20")          # margen máximo por posición (% del equity)
+    risk_max_trade_risk_pct: Decimal = Decimal("1.0")       # % del equity arriesgado por trade (basado en SL)
     risk_max_consecutive_api_errors: int = 5
     risk_data_delay_threshold_s: int = 1800  # 30 min — barras de 15M pueden tardar hasta ~900s
 

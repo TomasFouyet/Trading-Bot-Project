@@ -58,11 +58,13 @@ class RiskManager:
         max_position_pct: Decimal | None = None,
         max_trade_risk_pct: Decimal | None = None,
         max_consecutive_api_errors: int | None = None,
+        leverage: int | None = None,
     ) -> None:
         self._max_daily_dd = max_daily_drawdown_pct or _settings.risk_max_daily_drawdown_pct
         self._max_position_pct = max_position_pct or _settings.risk_max_position_pct
         self._max_trade_risk_pct = max_trade_risk_pct or _settings.risk_max_trade_risk_pct
         self._max_api_errors = max_consecutive_api_errors or _settings.risk_max_consecutive_api_errors
+        self._leverage = Decimal(str(leverage or _settings.leverage))
         self._state = RiskState()
 
     def initialize(self, equity: Decimal, as_of_date: date | None = None) -> None:
@@ -191,34 +193,36 @@ class RiskManager:
             risk_per_unit = abs(price - signal.stop_loss)
 
             if risk_per_unit > 0:
-                # How much $ we're willing to lose on this trade
+                # Cuánto $ estamos dispuestos a perder si toca el SL
                 risk_amount = current_equity * (self._max_trade_risk_pct / 100) * confidence
 
-                # Position size from risk
+                # Tamaño de posición basado en riesgo
                 qty = risk_amount / risk_per_unit
 
-                # Cap at max_position_pct of equity (notional cap)
-                max_notional = current_equity * (self._max_position_pct / 100)
-                max_qty = max_notional / price
+                # Cap por margen máximo (max_position_pct = % del equity como margen)
+                # Con leverage: notional = margen × leverage → max_qty aumenta con leverage
+                max_margin = current_equity * (self._max_position_pct / 100)
+                max_qty = (max_margin * self._leverage) / price
                 qty = min(qty, max_qty)
 
                 qty = qty.quantize(Decimal("0.001"))
                 return max(qty, Decimal("0.001"))
 
-        # ── Fallback: notional-based sizing (no SL provided) ─────────────
-        max_notional = current_equity * (self._max_position_pct / 100)
-        scaled_notional = max_notional * confidence
-        qty = scaled_notional / price
+        # ── Fallback: sizing por margen cuando no hay SL ─────────────────
+        max_margin = current_equity * (self._max_position_pct / 100)
+        scaled_margin = max_margin * confidence
+        qty = (scaled_margin * self._leverage) / price
 
         # Round to reasonable precision
         qty = qty.quantize(Decimal("0.001"))
         return max(qty, Decimal("0.001"))
 
     def _estimate_notional(self, signal: Signal, equity: Decimal) -> Decimal:
-        """Rough notional estimate — used only for the no-SL fallback check."""
+        """Margen estimado — usado solo para el check sin SL. max_position_pct = % equity como margen."""
+        max_margin = equity * (self._max_position_pct / 100)
         if signal.target_qty is not None:
-            return equity * (self._max_position_pct / 100)
-        return equity * (self._max_position_pct / 100) * Decimal(str(signal.confidence))
+            return max_margin
+        return max_margin * Decimal(str(signal.confidence))
 
     def on_api_error(self, error: str) -> None:
         """Call on every consecutive API error."""

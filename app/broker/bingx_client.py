@@ -446,6 +446,57 @@ class BingXClient:
         )
         return data if isinstance(data, dict) else {}
 
+    async def place_stop_order(
+        self,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        qty: float,
+        pos_side: str,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """
+        Place a STOP_MARKET order on BingX perpetual futures.
+
+        This is used to set a hard stop-loss on the exchange so that if the bot
+        crashes or goes offline, open positions are protected automatically.
+
+        Args:
+            symbol:           e.g. "BTC-USDT"
+            side:             "BUY" to close a SHORT, "SELL" to close a LONG
+            stop_price:       trigger price for the stop-market order
+            qty:              position quantity to close
+            pos_side:         "LONG" or "SHORT" (hedge-mode positionSide)
+            client_order_id:  optional idempotency key (alphanumeric, max 36 chars)
+        """
+        sym = normalize_symbol(symbol)
+        payload: dict[str, Any] = {
+            "symbol": sym,
+            "side": side.upper(),
+            "type": "STOP_MARKET",
+            "quantity": str(qty),
+            "stopPrice": str(stop_price),
+            "positionSide": pos_side.upper(),
+        }
+        if client_order_id:
+            payload["clientOrderID"] = client_order_id.replace("-", "")[:36]
+
+        data = await self._request_with_retry(
+            "POST", self._order_path(), json=payload, signed=True
+        )
+        return data if isinstance(data, dict) else {"order": data}
+
+    async def cancel_all_open_orders(self, symbol: str) -> dict:
+        """Cancel all open orders for a symbol (e.g. stale SL orders on position close)."""
+        sym = normalize_symbol(symbol)
+        data = await self._request_with_retry(
+            "DELETE",
+            "/openApi/swap/v2/trade/allOpenOrders",
+            params={"symbol": sym},
+            signed=True,
+        )
+        return data if isinstance(data, dict) else {}
+
     async def close(self) -> None:
         await self._client.aclose()
 

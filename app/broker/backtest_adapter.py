@@ -49,6 +49,7 @@ class BacktestAdapter(BrokerAdapter):
         commission_rate: Decimal | None = None,
         maker_commission_rate: Decimal | None = None,
         slippage_rate: Decimal | None = None,
+        leverage: int = 1,
     ) -> None:
         self._bars = bars
         self._bar_index: int = 0
@@ -60,6 +61,7 @@ class BacktestAdapter(BrokerAdapter):
         self._commission = commission_rate or _settings.commission_rate
         self._maker_commission = maker_commission_rate or _settings.maker_commission_rate
         self._slippage = slippage_rate or _settings.slippage_rate
+        self._leverage = Decimal(str(leverage))
 
         self._positions: dict[str, Position] = {}
         self._orders: dict[str, OrderResult] = {}
@@ -142,20 +144,31 @@ class BacktestAdapter(BrokerAdapter):
         return price * (1 - self._slippage)
 
     def _apply_fill_to_portfolio(self, fill: FillResult) -> None:
+        """
+        Futures margin model:
+          - Open:  deduct margin (notional / leverage) + fee
+          - Close: return margin + realized PnL - fee
+        """
         notional = fill.price * fill.qty
+        margin = notional / self._leverage
         pos = self._positions.get(fill.symbol)
 
         if fill.side == OrderSide.BUY:
             if pos and pos.side == TradeSide.SHORT:
-                # Closing a SHORT position: pay to buy back
+                # Closing a SHORT position
                 close_qty = min(fill.qty, pos.qty)
+                avg_px = pos.avg_price
+                realized_pnl = (avg_px - fill.price) * close_qty
+                returned_margin = avg_px * close_qty / self._leverage
+                # Liquidation model: can't recover more than margin on a loss
+                net = returned_margin + realized_pnl - fill.fee
+                self._balance += max(net, Decimal("0"))
                 pos.qty -= close_qty
                 if pos.qty <= Decimal("1e-10"):
                     del self._positions[fill.symbol]
-                self._balance -= fill.price * close_qty + fill.fee
             else:
-                # Opening a LONG position
-                cost = notional + fill.fee
+                # Opening a LONG position: deposit margin
+                cost = margin + fill.fee
                 if self._balance < cost:
                     logger.warning("backtest_insufficient_funds", required=str(cost), available=str(self._balance))
                 self._balance -= cost
@@ -176,13 +189,21 @@ class BacktestAdapter(BrokerAdapter):
             if pos and pos.side == TradeSide.LONG and pos.qty > 0:
                 # Closing a LONG position
                 sell_qty = min(fill.qty, pos.qty)
+                avg_px = pos.avg_price
+                realized_pnl = (fill.price - avg_px) * sell_qty
+                returned_margin = avg_px * sell_qty / self._leverage
+                # Liquidation model: can't recover more than margin on a loss
+                net = returned_margin + realized_pnl - fill.fee
+                self._balance += max(net, Decimal("0"))
                 pos.qty -= sell_qty
                 if pos.qty <= Decimal("1e-10"):
                     del self._positions[fill.symbol]
-                self._balance += sell_qty * fill.price - fill.fee
             else:
-                # Opening a SHORT position: receive proceeds
-                self._balance += notional - fill.fee
+                # Opening a SHORT position: deposit margin
+                cost = margin + fill.fee
+                if self._balance < cost:
+                    logger.warning("backtest_insufficient_funds", required=str(cost), available=str(self._balance))
+                self._balance -= cost
                 self._positions[fill.symbol] = Position(
                     symbol=fill.symbol,
                     side=TradeSide.SHORT,
@@ -192,15 +213,16 @@ class BacktestAdapter(BrokerAdapter):
                 )
 
     def _mark_to_market(self) -> Decimal:
-        """Total equity = cash + mark-to-market of open positions."""
+        """Total equity = balance (margin account) + unrealized PnL of open positions."""
         equity = self._balance
         if self._current_bar:
+            current_price = self._current_bar.close
             for pos in self._positions.values():
                 if pos.symbol == self._current_bar.symbol:
                     if pos.side == TradeSide.LONG:
-                        equity += pos.qty * self._current_bar.close
-                    else:  # SHORT: subtract current liability
-                        equity -= pos.qty * self._current_bar.close
+                        equity += (current_price - pos.avg_price) * pos.qty
+                    else:  # SHORT
+                        equity += (pos.avg_price - current_price) * pos.qty
         return equity
 
     # ── BrokerAdapter interface ────────────────────────────────────────────
@@ -244,11 +266,12 @@ class BacktestAdapter(BrokerAdapter):
         return positions
 
     async def get_balance(self) -> list[Balance]:
+        bal = max(self._balance, Decimal("0"))
         return [
             Balance(
                 currency="USDT",
-                total=self._balance,
-                available=self._balance,
+                total=bal,
+                available=bal,
                 used=Decimal("0"),
             )
         ]

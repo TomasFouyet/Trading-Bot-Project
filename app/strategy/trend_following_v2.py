@@ -115,9 +115,12 @@ class TrendFollowingV2(BaseStrategy):
         # ── SL structure (Pine: SL CALCULATION section) ──────────────
         self._sl_lookback    = int(self.params.get("sl_swing_lookback",         50))
         self._sl_window      = int(self.params.get("sl_swing_window",           3))
-        self._sl_min_atr     = float(self.params.get("sl_min_atr",              1.0))
-        self._sl_max_atr     = float(self.params.get("sl_max_atr",              2.5))
+        self._sl_min_atr     = float(self.params.get("sl_min_atr",              1.5))
+        self._sl_max_atr     = float(self.params.get("sl_max_atr",              3.0))
         self._sl_buf_atr     = float(self.params.get("sl_buffer_atr",           0.3))
+        # Minimum SL distance as % of price — floor to protect against gap risk
+        # during low-ATR periods (e.g. 0.015 = 1.5% means SL always >= 1.5% away)
+        self._sl_min_pct     = float(self.params.get("sl_min_pct",              0.015))
 
         # ── TP per tier (Pine: TP1/TP2 R inputs) ─────────────────────
         self._tp1_r_A = float(self.params.get("tp1_r_A", 1.5))
@@ -146,7 +149,7 @@ class TrendFollowingV2(BaseStrategy):
 
         # ── Layer 4: Patience timer ──────────────────────────────────
         self._use_patience   = bool(self.params.get("use_patience",             True))
-        self._soft_sl_bars   = int(self.params.get("soft_sl_bars",              48))
+        self._soft_sl_bars   = int(self.params.get("soft_sl_bars",               0))
 
         # ── Internal state (mirrors Pine var declarations) ────────────
         self._trade = TradeState()
@@ -370,12 +373,14 @@ class TrendFollowingV2(BaseStrategy):
 
         tp1_r, tp2_r = self._get_tp_ratios(conf)
 
+        min_dist_pct = close * self._sl_min_pct  # absolute price floor for SL distance
+
         if direction == "LONG":
             fallback = float(df["low"].iloc[-lb:].min()) if lb > 0 else close
             base = swing if swing_found else fallback
             struct_sl = min(base, ema_slow) - atr * self._sl_buf_atr
             dist = close - struct_sl
-            dist = max(dist, atr * self._sl_min_atr)
+            dist = max(dist, atr * self._sl_min_atr, min_dist_pct)
             dist = min(dist, atr * self._sl_max_atr)
             sl = close - dist
             risk = abs(close - sl)
@@ -386,7 +391,7 @@ class TrendFollowingV2(BaseStrategy):
             base = swing if swing_found else fallback
             struct_sl = max(base, ema_slow) + atr * self._sl_buf_atr
             dist = struct_sl - close
-            dist = max(dist, atr * self._sl_min_atr)
+            dist = max(dist, atr * self._sl_min_atr, min_dist_pct)
             dist = min(dist, atr * self._sl_max_atr)
             sl = close + dist
             risk = abs(close - sl)
@@ -753,7 +758,7 @@ class TrendFollowingV2(BaseStrategy):
         size_mult = self._get_size_mult(conf)
         sess_m, sess_name = self._get_session(ts)
         strk_m, strk_reason = self._get_streak_mult()
-        final_mult = round(max(0.10, min(size_mult * sess_m * strk_m, 2.0)), 3)
+        final_mult = round(max(0.10, min(size_mult * sess_m * strk_m, 1.5)), 3)
 
         # Set trade state
         self._trade.state = 1 if direction == "LONG" else -1
