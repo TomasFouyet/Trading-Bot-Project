@@ -141,6 +141,9 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
         print(f"  [{s}] ERROR loading warmup: {e}")
         return
     bw: deque = deque(warmup[:-1], maxlen=WINDOW_SIZE)
+    last_processed_ts = bw[-1].ts if bw else None
+    # Force flat state — runner has no open position at startup
+    strategy.force_close()
     print(f"  [{s}] Ready — {len(bw)} bars loaded")
 
     # HTF bias
@@ -178,6 +181,11 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                 bar = get_bar.result()
             except StopAsyncIteration:
                 break
+
+            # Skip bars already seen in warmup
+            if last_processed_ts is not None and bar.ts <= last_processed_ts:
+                continue
+            last_processed_ts = bar.ts
 
             bw.append(bar)
             if len(bw) < strategy.min_bars_required:
@@ -330,6 +338,7 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                         partial_pnl = _calc_partial_pnl(open_trade, fill)
                         open_trade["qty"] -= fill.qty
                         open_trade["total_partial_pnl"] += partial_pnl
+                        open_trade["total_partial_fees"] += fill.fee
 
                         print(f"\n  [{s}] TP1 {close_pct*100:.0f}% @ ${float(fill.price):,.2f}"
                               f"  pnl=${float(partial_pnl):+.2f}  → trailing SL\n")
@@ -342,9 +351,10 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                                 entry_price=float(open_trade["entry_price"]),
                             ))
 
-                        # If qty exhausted
+                        # If qty exhausted (all closed via partials)
                         if open_trade["qty"] < Decimal("0.001"):
-                            state["wins" if partial_pnl > 0 else "losses"] += 1
+                            total_pnl = open_trade["total_partial_pnl"]
+                            state["wins" if total_pnl > 0 else "losses"] += 1
                             open_trade = None
                             state["positions"].pop(symbol, None)
 
@@ -404,6 +414,7 @@ async def run_symbol(symbol, client, adapter, args, settings, tier_lev, params,
                             "original_qty": fill.qty,
                             "fee_in": fill.fee,
                             "total_partial_pnl": Decimal("0"),
+                            "total_partial_fees": Decimal("0"),
                             "strategy": strategy.strategy_id,
                             "tier": tier,
                             "leverage": lev,
@@ -487,6 +498,11 @@ def _calc_partial_pnl(ot: dict, fill) -> Decimal:
 
 def _log_trade(ot: dict, fill, exit_type: str, pnl: Decimal, strategy):
     n = ot["entry_price"] * ot["original_qty"]
+    # fee_in is the full entry fee; prorate it for the remaining qty at close
+    # (the rest was already accounted in partial closes)
+    fee_pct = fill.qty / ot["original_qty"] if ot["original_qty"] else Decimal("1")
+    proportional_fee_in = ot["fee_in"] * fee_pct
+    total_fees = proportional_fee_in + ot.get("total_partial_fees", Decimal("0")) + fill.fee
     _append_csv({
         "trade_id": ot["trade_id"], "symbol": ot["symbol"], "side": ot["side"],
         "strategy": ot.get("strategy", ""), "tier": ot.get("tier", ""),
@@ -499,7 +515,7 @@ def _log_trade(ot: dict, fill, exit_type: str, pnl: Decimal, strategy):
         "qty": float(ot["original_qty"]),
         "pnl": float(pnl.quantize(Decimal("0.01"))),
         "pnl_pct": round(float(pnl / n * 100) if n else 0, 4),
-        "fees": float((ot["fee_in"] + fill.fee).quantize(Decimal("0.01"))),
+        "fees": float(total_fees.quantize(Decimal("0.01"))),
         "signal_reason": ot.get("signal_reason", ""),
     })
 
@@ -528,6 +544,48 @@ async def _status_loop(state, symbols, shutdown_event):
             pass
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=STATUS_SECS)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Telegram command loop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _telegram_command_loop(state, shutdown_event):
+    """Poll Telegram for commands and respond. Supported: /equity"""
+    notifier = state.get("notifier")
+    if not notifier:
+        return
+    offset = 0
+    while not shutdown_event.is_set():
+        try:
+            messages, offset = await notifier.poll_commands(offset)
+            for msg in messages:
+                text = msg["text"].strip().lower()
+                if text == "/equity":
+                    eq  = state.get("equity", 0)
+                    w   = state.get("wins", 0)
+                    l   = state.get("losses", 0)
+                    t   = w + l
+                    wr  = f"{w/t*100:.0f}%" if t else "—"
+                    pos = state.get("positions", {})
+                    pos_lines = ""
+                    for sym, ot in pos.items():
+                        pos_lines += f"\n  📌 {sym} {ot['side']} @ ${float(ot['entry_price']):,.2f}"
+                    await notifier.send(
+                        f"💰 <b>EQUITY</b>\n"
+                        f"\n"
+                        f"💵 Balance:  <code>${eq:,.2f}</code>\n"
+                        f"📊 Trades:   {t}  (W={w}  L={l}  WR={wr})\n"
+                        f"{'📌 Positions:' + pos_lines if pos_lines else '📭 No open positions'}\n"
+                        f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                    )
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=5)
             break
         except asyncio.TimeoutError:
             pass
@@ -647,6 +705,10 @@ async def main(args):
     status_task = asyncio.create_task(
         _status_loop(state, symbols, shutdown_event))
     worker_tasks.append(status_task)
+
+    cmd_task = asyncio.create_task(
+        _telegram_command_loop(state, shutdown_event))
+    worker_tasks.append(cmd_task)
 
     results = await asyncio.gather(*worker_tasks, return_exceptions=True)
     for i, r in enumerate(results):

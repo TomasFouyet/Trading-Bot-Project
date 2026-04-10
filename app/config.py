@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     risk_max_position_pct: Decimal = Decimal("100")  # notional cap; risk-based sizing controls real exposure
     risk_max_trade_risk_pct: Decimal = Decimal("3.0")   # % of equity risked per trade (SL-based)
     risk_max_consecutive_api_errors: int = 5
-    risk_data_delay_threshold_s: int = 60
+    risk_data_delay_threshold_s: int = 1800  # 30 min — barras de 15M pueden tardar hasta ~900s
 
     # ── Costs ───────────────────────────────────────────────
     commission_bps: Decimal = Decimal("7.5")        # 0.075%  taker (market orders)

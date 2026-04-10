@@ -232,6 +232,30 @@ class TelegramNotifier:
         )
         return await self.send(msg)
 
+    async def poll_commands(self, offset: int = 0) -> tuple[list[dict], int]:
+        """
+        Poll for new Telegram updates (messages/commands).
+        Returns (list of messages, next_offset).
+        """
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params={"offset": offset, "timeout": 1})
+            data = r.json()
+            if not data.get("ok"):
+                return [], offset
+            updates = data.get("result", [])
+            messages = []
+            next_offset = offset
+            for u in updates:
+                next_offset = u["update_id"] + 1
+                msg = u.get("message") or u.get("channel_post")
+                if msg and msg.get("text"):
+                    messages.append({"text": msg["text"], "chat_id": str(msg["chat"]["id"])})
+            return messages, next_offset
+        except Exception:
+            return [], offset
+
     async def bot_stopped(self, total_trades: int, net_pnl: float, wins: int, losses: int) -> bool:
         wr    = wins / total_trades * 100 if total_trades else 0
         emoji = "🟢" if net_pnl >= 0 else "🔴"

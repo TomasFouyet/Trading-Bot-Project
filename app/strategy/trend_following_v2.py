@@ -718,7 +718,8 @@ class TrendFollowingV2(BaseStrategy):
         tp2_hit_short = t.is_short() and t.tp1_hit and bar_low  <= t.tp2
 
         if tp2_hit_long or tp2_hit_short:
-            pnl_pct = self._pnl_pct(t.tp2)
+            tp2_price = t.tp2  # capture before reset clears it
+            pnl_pct = self._pnl_pct(tp2_price)
             self._trade.reset()
             return Signal(
                 action=SignalAction.CLOSE,
@@ -728,7 +729,7 @@ class TrendFollowingV2(BaseStrategy):
                 meta={
                     **ind,
                     "exit_type": "tp2",
-                    "exit_price": t.tp2,
+                    "exit_price": tp2_price,
                     "pnl_pct": pnl_pct,
                 },
             )

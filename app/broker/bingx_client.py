@@ -110,10 +110,7 @@ class BingXClient:
         self._market_type = market_type
         self._client = httpx.AsyncClient(
             timeout=timeout,
-            headers={
-                "X-BX-APIKEY": self._api_key,
-                "Content-Type": "application/json",
-            },
+            headers={"X-BX-APIKEY": self._api_key},
         )
 
     # ── Auth helpers ─────────────────────────────────────────────────────────
@@ -121,20 +118,34 @@ class BingXClient:
     def _timestamp_ms(self) -> int:
         return int(time.time() * 1000)
 
-    def _sign(self, params: dict[str, Any]) -> str:
-        """HMAC-SHA256 signature over sorted query string."""
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    def _build_query_string(self, params: dict[str, Any]) -> str:
+        """
+        Replica exacta de parseParam() del ejemplo oficial BingX:
+        1. Ordena las claves alfabéticamente
+        2. Construye key=value&key=value
+        3. Agrega &timestamp=... al final
+        La firma se calcula sobre esta cadena completa.
+        """
+        filtered = {k: v for k, v in params.items() if v is not None}
+        sorted_str = "&".join(f"{k}={v}" for k, v in sorted(filtered.items()))
+        ts = self._timestamp_ms()
+        if sorted_str:
+            return f"{sorted_str}&timestamp={ts}", ts
+        return f"timestamp={ts}", ts
+
+    def _sign(self, query_string: str) -> str:
+        """HMAC-SHA256 sobre el query string ya construido (sin signature)."""
         return hmac.new(
             self._api_secret.encode("utf-8"),
-            query.encode("utf-8"),
+            query_string.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-    def _build_signed_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        params = {k: v for k, v in params.items() if v is not None}
-        params["timestamp"] = self._timestamp_ms()
-        params["signature"] = self._sign(params)
-        return params
+    def _build_signed_url(self, path: str, params: dict[str, Any]) -> str:
+        """Construye la URL final: base + path + ?query_string&signature=..."""
+        query_string, _ = self._build_query_string(params)
+        signature = self._sign(query_string)
+        return f"{self._base_url}{path}?{query_string}&signature={signature}"
 
     # ── Route helpers ─────────────────────────────────────────────────────────
 
@@ -178,23 +189,20 @@ class BingXClient:
         json: dict | None = None,
         signed: bool = False,
     ) -> Any:
-        url = self._url(path)
-        req_params = params or {}
-        req_json = json or {}
+        # Merge all parameters (query + body) into one dict for signing
+        all_params = {**(params or {}), **(json or {})}
 
         if signed:
-            if method.upper() in ("GET", "DELETE"):
-                req_params = self._build_signed_params(req_params)
-            else:
-                req_json = self._build_signed_params(req_json)
+            # BingX: ALL params go in query string (signed URL), body is empty
+            url = self._build_signed_url(path, all_params)
+            req_params = None
+        else:
+            # Unsigned: normal query string via httpx params=
+            url = self._url(path)
+            req_params = all_params if all_params else None
 
         try:
-            response = await self._client.request(
-                method,
-                url,
-                params=req_params if method.upper() in ("GET", "DELETE") else None,
-                json=req_json if method.upper() in ("POST", "PUT") else None,
-            )
+            response = await self._client.request(method, url, params=req_params)
         except httpx.TimeoutException as e:
             raise BrokerError(f"Request timeout: {path}") from e
         except httpx.NetworkError as e:
