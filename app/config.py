@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     bot_mode: BotMode = BotMode.PAPER
     default_symbol: str = "BTC-USDT"
     default_timeframe: str = "5m"
-    leverage: int = Field(default=5, ge=1, le=125)
+    leverage: int = Field(default=3, ge=1, le=125)
 
     # ── Risk manager ────────────────────────────────────────
     risk_max_daily_drawdown_pct: Decimal = Decimal("5.0")   # kill switch diario

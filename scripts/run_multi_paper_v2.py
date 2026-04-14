@@ -52,7 +52,7 @@ BEST_PARAMS: dict = {
     "adx_min": 20, "adx_strong": 35,
     "pullback_tolerance_atr": 1.0,
     "allow_short": True,
-    "min_confidence": 0.30,   # solo señales Tier B/A (≥0.30 conf) — filtra ruido
+    "min_confidence": 0.50,   # solo señales Tier A (≥0.50 conf) — backtested óptimo
     "sig_cooldown": 5,
     "enable_reversal": True,
     # ── SL — mínimo 1.5 ATR + 1.5% precio para absorber gap risk con leverage ─
@@ -64,7 +64,6 @@ BEST_PARAMS: dict = {
     "tp1_r_B": 1.5, "tp2_r_B": 2.5,
     "tp1_r_C": 1.0, "tp2_r_C": 1.5,
     # ── Sesión: DESACTIVADO para igualar Pine Script ──────────────────────────
-    # Pine Script no ajusta tamaño por sesión — usamos los mismos pesos aquí
     "use_session_filter": False,
     # ── Streak adjuster: DESACTIVADO — Pine Script no lo usa ─────────────────
     "use_streak_adj": False,
@@ -760,9 +759,9 @@ if __name__ == "__main__":
     p.add_argument("--balance",       type=float, default=500.0)
     p.add_argument("--max-positions", type=int,   default=3,    dest="max_positions")
     p.add_argument("--alloc-pct",     type=float, default=20.0, dest="alloc_pct")
-    p.add_argument("--lev-a",  type=int, default=5,  dest="lev_a")
-    p.add_argument("--lev-b",  type=int, default=3,  dest="lev_b")
-    p.add_argument("--lev-c",  type=int, default=2,  dest="lev_c")
+    p.add_argument("--lev-a",  type=int, default=3,  dest="lev_a")   # backtested: 3x > 5x
+    p.add_argument("--lev-b",  type=int, default=2,  dest="lev_b")
+    p.add_argument("--lev-c",  type=int, default=1,  dest="lev_c")
     p.add_argument("--params-file", default=None, dest="params_file")
     p.add_argument("--check",      action="store_true")
     p.add_argument("--live-bingx", action="store_true", dest="live_bingx")

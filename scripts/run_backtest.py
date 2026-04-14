@@ -204,8 +204,8 @@ if __name__ == "__main__":
                         help="Strategy to backtest")
     parser.add_argument("--commission-bps", type=float, default=7.5, dest="commission_bps")
     parser.add_argument("--slippage-bps", type=float, default=5.0, dest="slippage_bps")
-    parser.add_argument("--leverage", type=int, default=10,
-                        help="Futures leverage (default: 10)")
+    parser.add_argument("--leverage", type=int, default=3,
+                        help="Futures leverage (default: 3)")
     parser.add_argument("--max-dd", type=float, default=100.0, dest="max_dd",
                         help="Max daily drawdown %% kill switch (default: 100 = disabled for backtests)")
     parser.add_argument("--output", default=None, help="Save full JSON report to file")

@@ -1,0 +1,1 @@
+timestamp,symbol,side,entry_price,exit_price,exit_type,sl,tp,pnl_pct,pnl_usd,equity_after,leverage_used,sl_dist_pct,adx_at_entry,atr_at_entry,htf_bias_at_entry,duration_bars
