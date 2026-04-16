@@ -79,9 +79,11 @@ TRADES_HEADER = [
     "timestamp", "symbol", "side", "entry_price", "exit_price", "exit_type",
     "sl", "tp", "pnl_pct", "pnl_usd", "equity_after", "leverage_used",
     "sl_dist_pct", "adx_at_entry", "atr_at_entry", "htf_bias_at_entry",
-    "duration_bars",
+    "duration_bars", "entry_fee_type", "exit_fee_type",
 ]
-COMMISSION_RATE = Decimal("0.00075")
+# BingX Futures fees: maker (limit) 0.020%, taker (market) 0.050%
+MAKER_FEE = Decimal("0.00020")
+TAKER_FEE = Decimal("0.00050")
 
 # Global headless flag — set from CLI args
 _HEADLESS = False
@@ -228,10 +230,13 @@ def compute_position(
 # Synthetic fill for paper mode
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _make_paper_fill(symbol: str, price: float, qty: Decimal, side):
+def _make_paper_fill(symbol: str, price: float, qty: Decimal, side,
+                     order_type: str = "market"):
+    """Synthetic fill for paper mode. order_type='limit' → maker fee, 'market' → taker fee."""
     from app.broker.base import FillResult
     px = Decimal(str(price))
-    fee = px * qty * COMMISSION_RATE
+    fee_rate = MAKER_FEE if order_type == "limit" else TAKER_FEE
+    fee = px * qty * fee_rate
     return FillResult(
         fill_id=str(uuid.uuid4()),
         order_id=str(uuid.uuid4()),
@@ -624,9 +629,12 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                     il = open_trade["side"] == "LONG"
 
                     if not is_live:
+                        # TP → limit order (maker fee); SL/close → market (taker fee)
+                        exit_order_type = "limit" if exit_type == "tp" else "market"
                         fill = _make_paper_fill(
                             symbol, exit_price, open_trade["qty"],
-                            OrderSide.SELL if il else OrderSide.BUY)
+                            OrderSide.SELL if il else OrderSide.BUY,
+                            order_type=exit_order_type)
                     else:
                         try:
                             _, fill = await adapter.place_order(OrderRequest(
@@ -692,6 +700,8 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                             "atr_at_entry": open_trade["atr_at_entry"],
                             "htf_bias_at_entry": open_trade["htf_bias_at_entry"],
                             "duration_bars": bar_count_in_trade,
+                            "entry_fee_type": open_trade.get("entry_fee_type", "taker"),
+                            "exit_fee_type": "maker" if exit_type == "tp" else "taker",
                         })
 
                         # Telegram — rich close notification
@@ -797,7 +807,9 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                     side = OrderSide.BUY if il else OrderSide.SELL
 
                     if not is_live:
-                        fill = _make_paper_fill(symbol, close, qty_dec, side)
+                        # Entry = limit order (maker fee)
+                        fill = _make_paper_fill(symbol, close, qty_dec, side,
+                                                 order_type="limit")
                     else:
                         try:
                             _, fill = await adapter.place_order(OrderRequest(
@@ -818,6 +830,7 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                             "entry_price": fill.price,
                             "qty": fill.qty,
                             "fee_in": fill.fee,
+                            "entry_fee_type": "maker" if not is_live else "taker",
                             "sl": Decimal(str(sl_price)),
                             "tp": Decimal(str(tp_price)),
                             "leverage": leverage,
@@ -1066,6 +1079,7 @@ async def main(args):
         f"\u26a1 Risk/trade: {RISK_CONFIG['risk_pct_per_trade']}%\n"
         f"\U0001f9ed HTF Filter: {'ON (4H EMA50)' if HTF_CONFIG['enabled'] else 'OFF'}\n"
         f"\U0001f6e1 Circuit Breaker: warn={RISK_CONFIG['max_daily_dd_pct']:.0f}% / stop={RISK_CONFIG['circuit_breaker_pct']:.0f}%\n"
+        f"\U0001f4b8 Fees: entry limit 0.020% | SL market 0.050% | TP limit 0.020% (avg RT ~0.056%)\n"
         f"{'Modo headless \u2014 solo Telegram' + chr(10) if _HEADLESS else ''}"
         f"\nComandos disponibles:\n"
         f"/status \u2014 estado actual\n"

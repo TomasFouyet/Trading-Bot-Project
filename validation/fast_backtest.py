@@ -119,6 +119,10 @@ def fast_backtest(
     regime_labels: np.ndarray | None = None,
     regime_skip: set | None = None,
     regime_rr_map: dict | None = None,
+    # Trailing stop parameters
+    use_trail: bool = False,
+    activation_r: float = 0.8,
+    trail_r: float = 0.5,
 ) -> BacktestMetrics:
     """
     Run a fast single-pass backtest.
@@ -161,7 +165,13 @@ def fast_backtest(
     entry_price = 0.0
     sl_price = 0.0
     tp_price = 0.0
+    sl_dist = 0.0   # absolute SL distance for R-unit calculations
     entry_bar = 0
+
+    # Trailing stop state
+    trail_active = False
+    trail_stop = 0.0
+    peak_favorable = 0.0
 
     prev_long_sig = False
     prev_short_sig = False
@@ -180,25 +190,60 @@ def fast_backtest(
 
         # ── Check exits first ─────────────────────────────────────
         if in_trade:
+            # -- Trailing stop logic (only when use_trail=True) --
+            trail_exit = False
+            trail_exit_price = 0.0
+
+            if use_trail and sl_dist > 0:
+                # Update peak favorable price
+                if trade_dir == 1:
+                    peak_favorable = max(peak_favorable, h)
+                else:
+                    peak_favorable = min(peak_favorable, lo)
+
+                # Compute MFE in R units
+                if trade_dir == 1:
+                    mfe_r = (peak_favorable - entry_price) / sl_dist
+                else:
+                    mfe_r = (entry_price - peak_favorable) / sl_dist
+
+                # Activate trail if threshold reached
+                if not trail_active and mfe_r >= activation_r:
+                    trail_active = True
+                    if trade_dir == 1:
+                        trail_stop = peak_favorable - trail_r * sl_dist
+                    else:
+                        trail_stop = peak_favorable + trail_r * sl_dist
+
+                # Ratchet trail stop (only moves in favorable direction)
+                if trail_active:
+                    if trade_dir == 1:
+                        new_trail = peak_favorable - trail_r * sl_dist
+                        trail_stop = max(trail_stop, new_trail)
+                        # Trail can never be worse than original SL
+                        trail_stop = max(trail_stop, sl_price)
+                    else:
+                        new_trail = peak_favorable + trail_r * sl_dist
+                        trail_stop = min(trail_stop, new_trail)
+                        trail_stop = min(trail_stop, sl_price)
+
+                    # Check trail stop hit
+                    if trade_dir == 1 and lo <= trail_stop:
+                        trail_exit = True
+                        trail_exit_price = trail_stop
+                    elif trade_dir == -1 and h >= trail_stop:
+                        trail_exit = True
+                        trail_exit_price = trail_stop
+
+            # -- Regular SL/TP check --
             sl_hit = (trade_dir == 1 and lo <= sl_price) or \
                      (trade_dir == -1 and h >= sl_price)
             tp_hit = (trade_dir == 1 and h >= tp_price) or \
                      (trade_dir == -1 and lo <= tp_price)
 
-            if sl_hit:
-                pnl = _pnl(trade_dir, entry_price, sl_price)
-                trades.append(TradeRecord(
-                    direction="LONG" if trade_dir == 1 else "SHORT",
-                    entry_price=entry_price,
-                    exit_price=sl_price,
-                    pnl_pct=pnl,
-                    exit_type="sl",
-                    bars_held=i - entry_bar,
-                    entry_bar_idx=entry_bar,
-                ))
-                in_trade = False
-                continue
-            elif tp_hit:
+            # Priority: TP > trail > SL
+            # (TP is best for trader; trail is better than SL)
+            if tp_hit:
                 pnl = _pnl(trade_dir, entry_price, tp_price)
                 trades.append(TradeRecord(
                     direction="LONG" if trade_dir == 1 else "SHORT",
@@ -210,6 +255,35 @@ def fast_backtest(
                     entry_bar_idx=entry_bar,
                 ))
                 in_trade = False
+                trail_active = False
+                continue
+            elif trail_exit:
+                pnl = _pnl(trade_dir, entry_price, trail_exit_price)
+                trades.append(TradeRecord(
+                    direction="LONG" if trade_dir == 1 else "SHORT",
+                    entry_price=entry_price,
+                    exit_price=trail_exit_price,
+                    pnl_pct=pnl,
+                    exit_type="trail",
+                    bars_held=i - entry_bar,
+                    entry_bar_idx=entry_bar,
+                ))
+                in_trade = False
+                trail_active = False
+                continue
+            elif sl_hit:
+                pnl = _pnl(trade_dir, entry_price, sl_price)
+                trades.append(TradeRecord(
+                    direction="LONG" if trade_dir == 1 else "SHORT",
+                    entry_price=entry_price,
+                    exit_price=sl_price,
+                    pnl_pct=pnl,
+                    exit_type="sl",
+                    bars_held=i - entry_bar,
+                    entry_bar_idx=entry_bar,
+                ))
+                in_trade = False
+                trail_active = False
                 continue
 
         # ── Entry conditions (IDENTICAL to V2) ────────────────────
@@ -286,6 +360,9 @@ def fast_backtest(
                 trade_dir = 1
                 entry_bar = i
                 in_trade = True
+                trail_active = False
+                trail_stop = 0.0
+                peak_favorable = c
             elif short_trigger:
                 sl_dist = a * atr_sl_mult
                 entry_price = c
@@ -294,6 +371,9 @@ def fast_backtest(
                 trade_dir = -1
                 entry_bar = i
                 in_trade = True
+                trail_active = False
+                trail_stop = 0.0
+                peak_favorable = c
 
     # Close open trade at end
     if in_trade:
