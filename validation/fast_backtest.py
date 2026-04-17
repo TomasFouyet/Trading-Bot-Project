@@ -123,6 +123,12 @@ def fast_backtest(
     use_trail: bool = False,
     activation_r: float = 0.8,
     trail_r: float = 0.5,
+    # Structural stop parameters (backward-compatible defaults)
+    stop_mode: str = "ATR",
+    pivot_left: int = 3,
+    pivot_right: int = 3,
+    buffer_atr: float = 0.25,
+    min_risk_atr: float = 0.8,
 ) -> BacktestMetrics:
     """
     Run a fast single-pass backtest.
@@ -158,6 +164,23 @@ def fast_backtest(
     vol_sma = df["vol_sma"].values.astype(np.float64)
     n = len(df)
 
+    # ── Structural stop pre-computation (if requested) ───────────────
+    # When stop_mode="ATR" we skip this entirely → identical to original behavior.
+    last_pivot_low_arr: np.ndarray | None = None
+    last_pivot_high_arr: np.ndarray | None = None
+    if stop_mode != "ATR":
+        from validation.structural_stop import (
+            compute_pivot_lows,
+            compute_pivot_highs,
+            build_last_pivot_arrays,
+            compute_structural_sl,
+        )
+        pl_arr = compute_pivot_lows(low, pivot_left, pivot_right)
+        ph_arr = compute_pivot_highs(high, pivot_left, pivot_right)
+        last_pivot_low_arr, last_pivot_high_arr = build_last_pivot_arrays(
+            pl_arr, ph_arr, right=pivot_right
+        )
+
     # State
     trades: list[TradeRecord] = []
     in_trade = False
@@ -167,6 +190,7 @@ def fast_backtest(
     tp_price = 0.0
     sl_dist = 0.0   # absolute SL distance for R-unit calculations
     entry_bar = 0
+    last_sl_mode = "atr"
 
     # Trailing stop state
     trail_active = False
@@ -253,6 +277,7 @@ def fast_backtest(
                     exit_type="tp",
                     bars_held=i - entry_bar,
                     entry_bar_idx=entry_bar,
+                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
                 ))
                 in_trade = False
                 trail_active = False
@@ -267,6 +292,7 @@ def fast_backtest(
                     exit_type="trail",
                     bars_held=i - entry_bar,
                     entry_bar_idx=entry_bar,
+                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
                 ))
                 in_trade = False
                 trail_active = False
@@ -281,6 +307,7 @@ def fast_backtest(
                     exit_type="sl",
                     bars_held=i - entry_bar,
                     entry_bar_idx=entry_bar,
+                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
                 ))
                 in_trade = False
                 trail_active = False
@@ -353,10 +380,21 @@ def fast_backtest(
                     effective_rr = regime_rr_map[bar_regime]
 
             if long_trigger:
-                sl_dist = a * atr_sl_mult
                 entry_price = c
-                sl_price = c - sl_dist
-                tp_price = c + sl_dist * effective_rr
+                if stop_mode == "ATR" or last_pivot_low_arr is None:
+                    sl_price = c - a * atr_sl_mult
+                    last_sl_mode = "atr"
+                else:
+                    sl_price, last_sl_mode = compute_structural_sl(
+                        entry_price=c, direction="LONG", bar_idx=i,
+                        last_pivot_low=last_pivot_low_arr,
+                        last_pivot_high=last_pivot_high_arr,
+                        atr=a, stop_mode=stop_mode,
+                        atr_sl_mult=atr_sl_mult,
+                        buffer_atr=buffer_atr, min_risk_atr=min_risk_atr,
+                    )
+                sl_dist = abs(entry_price - sl_price)
+                tp_price = entry_price + sl_dist * effective_rr
                 trade_dir = 1
                 entry_bar = i
                 in_trade = True
@@ -364,10 +402,21 @@ def fast_backtest(
                 trail_stop = 0.0
                 peak_favorable = c
             elif short_trigger:
-                sl_dist = a * atr_sl_mult
                 entry_price = c
-                sl_price = c + sl_dist
-                tp_price = c - sl_dist * effective_rr
+                if stop_mode == "ATR" or last_pivot_high_arr is None:
+                    sl_price = c + a * atr_sl_mult
+                    last_sl_mode = "atr"
+                else:
+                    sl_price, last_sl_mode = compute_structural_sl(
+                        entry_price=c, direction="SHORT", bar_idx=i,
+                        last_pivot_low=last_pivot_low_arr,
+                        last_pivot_high=last_pivot_high_arr,
+                        atr=a, stop_mode=stop_mode,
+                        atr_sl_mult=atr_sl_mult,
+                        buffer_atr=buffer_atr, min_risk_atr=min_risk_atr,
+                    )
+                sl_dist = abs(sl_price - entry_price)
+                tp_price = entry_price - sl_dist * effective_rr
                 trade_dir = -1
                 entry_bar = i
                 in_trade = True
@@ -386,6 +435,7 @@ def fast_backtest(
             exit_type="end_of_data",
             bars_held=n - 1 - entry_bar,
             entry_bar_idx=entry_bar,
+            sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
         ))
 
     return _build_metrics(trades, df)

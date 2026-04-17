@@ -36,6 +36,7 @@ class TradeRecord:
     tp2: float = 0.0
     bars_held: int = 0
     entry_bar_idx: int = -1
+    sl_mode: str = "atr"    # "atr" | "structural" | "atr_fallback" | "min_risk_clamp"
 
     def to_dict(self) -> dict:
         return {
@@ -52,6 +53,7 @@ class TradeRecord:
             "tp2": self.tp2,
             "bars_held": self.bars_held,
             "entry_bar_idx": self.entry_bar_idx,
+            "sl_mode": self.sl_mode,
         }
 
 
