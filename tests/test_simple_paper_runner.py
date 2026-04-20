@@ -9,7 +9,7 @@ import pytest
 import pandas as pd
 
 from app.broker.bingx_client import BingXClient
-from app.broker.base import Position, TradeSide
+from app.broker.base import OHLCVBar, Position, TradeSide
 from app.core.exceptions import BrokerError
 from app.strategy.signals import SignalAction
 from app.strategy.trend_following_v2_simple import TrendFollowingV2Simple
@@ -96,6 +96,27 @@ def test_strategy_htf_filter_blocks_trade_state_mutation(monkeypatch):
     assert all(sig.action == SignalAction.HOLD for sig in signals)
     assert after["last_long_bar"] == before["last_long_bar"]
     assert after["trade"]["state"] == 0
+
+
+def test_simple_htf_bias_uses_strict_price_vs_ema():
+    htf = runner.SimpleHTFBias("BTC-USDT", ema_period=3)
+    bars = [
+        OHLCVBar(
+            symbol="BTC-USDT",
+            timeframe="4h",
+            ts=datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(hours=4 * i),
+            open=Decimal(str(price - 1)),
+            high=Decimal(str(price + 1)),
+            low=Decimal(str(price - 2)),
+            close=Decimal(str(price)),
+            volume=Decimal("10"),
+        )
+        for i, price in enumerate([100, 100, 100, 100.1])
+    ]
+
+    htf._compute(bars)
+
+    assert htf.bias == 1
 
 
 class _FlatAdapter:

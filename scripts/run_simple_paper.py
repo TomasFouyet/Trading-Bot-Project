@@ -314,10 +314,10 @@ class SimpleHTFBias:
         last_ema = float(ema.iloc[-1])
         self._last_refresh = bars[-1].ts
 
-        if last_close > last_ema * 1.002:
+        if last_close > last_ema:
             self._bias = 1
             self._bias_label = f"BULL (close={last_close:.0f} > EMA{self._ema_period}={last_ema:.0f})"
-        elif last_close < last_ema * 0.998:
+        elif last_close < last_ema:
             self._bias = -1
             self._bias_label = f"BEAR (close={last_close:.0f} < EMA{self._ema_period}={last_ema:.0f})"
         else:
