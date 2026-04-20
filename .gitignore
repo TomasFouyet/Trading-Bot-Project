@@ -10,6 +10,8 @@ build/
 .ruff_cache/
 .pytest_cache/
 *.log
+logs/
+data/live_signals.csv
 data/parquet/
 *.parquet
 .DS_Store
