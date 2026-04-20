@@ -12,6 +12,7 @@ build/
 *.log
 logs/
 data/live_signals.csv
+data/signal_service_state.json
 data/parquet/
 *.parquet
 .DS_Store

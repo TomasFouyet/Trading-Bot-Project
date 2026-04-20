@@ -31,6 +31,7 @@ python scripts/run_signal_service.py
 - Al arrancar hace un bootstrap silencioso con histórico reciente para reconstruir el estado del strategy.
 - Además envía un mensaje Telegram de arranque confirmando símbolo, timeframe, equity y sesgo HTF.
 - Luego envía un heartbeat cada 1 hora para confirmar que sigue corriendo.
+- Si lo detienes con `Ctrl+C`, hace shutdown ordenado: guarda estado en `data/signal_service_state.json`, flushea logs y envía mensaje de stop por Telegram.
 - En log verás una línea como:
 
 ```text
@@ -52,3 +53,4 @@ Service started | BTC-USDT 15m | equity=100.00 USDT | HTF bias=BULL
 ## Archivos generados
 - `logs/signal_service.log`: log rotado diariamente.
 - `data/live_signals.csv`: registro plano de señales enviadas.
+- `data/signal_service_state.json`: snapshot del estado al cerrar para recuperación ordenada.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
 import logging
 import os
 import signal
@@ -93,6 +94,7 @@ class ServiceConfig:
     telegram_chat_id: str = ""
     csv_path: Path = Path("data/live_signals.csv")
     log_path: Path = Path("logs/signal_service.log")
+    state_path: Path = Path("data/signal_service_state.json")
 
     @property
     def interval_delta(self) -> timedelta:
@@ -372,6 +374,7 @@ class SignalService:
         self.latest_htf_bias: int = 0
 
         _ensure_csv(config.csv_path)
+        self._restore_state_if_present()
 
     def bootstrap(self) -> ProcessSummary:
         df = self.fetcher(self.config.symbol, self.config.interval, self.config.fetch_limit)
@@ -512,8 +515,10 @@ class SignalService:
         return sent
 
     def stop(self) -> None:
+        self.logger.info("Shutdown requested | persisting service state")
+        self._save_state()
         if not self.dry_run:
-            self.telegram.send("Service stopped")
+            self.telegram.send(self._shutdown_message())
         for handler in self.logger.handlers:
             handler.flush()
 
@@ -521,6 +526,55 @@ class SignalService:
         with self.config.csv_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
             writer.writerow(row)
+
+    def _save_state(self) -> None:
+        self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at_utc": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "symbol": self.config.symbol,
+            "interval": self.config.interval,
+            "last_processed_ts": self.last_processed_ts.isoformat() if self.last_processed_ts is not None else None,
+            "last_signal_key": list(self.last_signal_key) if self.last_signal_key is not None else None,
+            "bootstrapped": self.bootstrapped,
+            "total_bars_processed": self.total_bars_processed,
+            "total_signals_emitted": self.total_signals_emitted,
+            "last_heartbeat_hour": self.last_heartbeat_hour,
+            "latest_htf_bias": self.latest_htf_bias,
+            "strategy_runtime_state": self.strategy.export_runtime_state(),
+        }
+        self.config.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.logger.info("State saved | path=%s", self.config.state_path)
+
+    def _restore_state_if_present(self) -> None:
+        if not self.config.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.logger.warning("State restore skipped | unreadable state file: %s", exc)
+            return
+
+        if payload.get("symbol") != self.config.symbol or payload.get("interval") != self.config.interval:
+            self.logger.info("State restore skipped | symbol/interval mismatch")
+            return
+
+        last_processed_ts = payload.get("last_processed_ts")
+        if last_processed_ts:
+            self.last_processed_ts = pd.Timestamp(last_processed_ts)
+        last_signal_key = payload.get("last_signal_key")
+        if isinstance(last_signal_key, list) and len(last_signal_key) == 2:
+            self.last_signal_key = (str(last_signal_key[0]), str(last_signal_key[1]))
+        self.bootstrapped = bool(payload.get("bootstrapped", False))
+        self.total_bars_processed = int(payload.get("total_bars_processed", 0))
+        self.total_signals_emitted = int(payload.get("total_signals_emitted", 0))
+        self.last_heartbeat_hour = payload.get("last_heartbeat_hour")
+        self.latest_htf_bias = int(payload.get("latest_htf_bias", 0))
+        self.strategy.restore_runtime_state(payload.get("strategy_runtime_state"))
+        self.logger.info(
+            "State restored | last_processed_ts=%s | signals=%d",
+            self.last_processed_ts.isoformat() if self.last_processed_ts is not None else "none",
+            self.total_signals_emitted,
+        )
 
     def _startup_message(self, htf: HTFSnapshot) -> str:
         return (
@@ -544,6 +598,18 @@ class SignalService:
             f"🔔 Signals emitted: <b>{self.total_signals_emitted}</b>\n"
             f"✅ Status: <b>running</b>\n\n"
             f"⏰ {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    def _shutdown_message(self) -> str:
+        last_bar = self.last_processed_ts.isoformat() if self.last_processed_ts is not None else "none"
+        return (
+            "⏹️ <b>Signal Service stopped</b>\n\n"
+            f"📊 Symbol: <b>{html.escape(self.config.symbol)}</b>\n"
+            f"🪵 Bars processed: <b>{self.total_bars_processed}</b>\n"
+            f"🔔 Signals emitted: <b>{self.total_signals_emitted}</b>\n"
+            f"🕒 Last processed bar: <b>{html.escape(last_bar)}</b>\n"
+            f"💾 State file: <code>{html.escape(str(self.config.state_path))}</code>\n\n"
+            f"⏰ {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
 
 

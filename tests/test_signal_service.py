@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
+import json
 
 import pandas as pd
 
@@ -253,3 +253,33 @@ def test_signal_service_sends_hourly_heartbeat_once_per_hour(tmp_path):
     assert third is True
     assert len(telegram.messages) == 3
     assert "Signal Service heartbeat" in telegram.messages[1]
+
+
+def test_signal_service_stop_persists_state_and_notifies(tmp_path):
+    base_df = _make_df(300)
+
+    def fake_fetcher(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+        return base_df.copy()
+
+    config = ServiceConfig(
+        symbol="BTC-USDT",
+        interval="15m",
+        paper_equity_usd=100.0,
+        log_level="INFO",
+        csv_path=tmp_path / "live_signals.csv",
+        log_path=tmp_path / "signal_service.log",
+        state_path=tmp_path / "signal_service_state.json",
+    )
+    telegram = _FakeTelegram(messages=[])
+    service = SignalService(config, fetcher=fake_fetcher, telegram=telegram, dry_run=False)
+
+    service.bootstrap()
+    service.stop()
+
+    assert config.state_path.exists()
+    state = json.loads(config.state_path.read_text(encoding="utf-8"))
+    assert state["symbol"] == "BTC-USDT"
+    assert state["interval"] == "15m"
+    assert state["bootstrapped"] is True
+    assert state["total_bars_processed"] >= 300
+    assert "Signal Service stopped" in telegram.messages[-1]
