@@ -111,7 +111,7 @@ def test_simple_htf_bias_uses_strict_price_vs_ema():
             close=Decimal(str(price)),
             volume=Decimal("10"),
         )
-        for i, price in enumerate([100, 100, 100, 100.1])
+        for i, price in enumerate([100.0] * 12 + [100.1])
     ]
 
     htf._compute(bars)
