@@ -76,6 +76,7 @@ class ProcessSummary:
     signals_emitted: int = 0
     startup: bool = False
     latest_htf_bias: int = 0
+    heartbeat_sent: bool = False
 
 
 @dataclass
@@ -367,6 +368,8 @@ class SignalService:
         self.bootstrapped = False
         self.total_bars_processed = 0
         self.total_signals_emitted = 0
+        self.last_heartbeat_hour: str | None = None
+        self.latest_htf_bias: int = 0
 
         _ensure_csv(config.csv_path)
 
@@ -378,6 +381,7 @@ class SignalService:
         df = df.reset_index(drop=True)
         history = df.tail(self.config.strategy_bars).reset_index(drop=True)
         latest_htf = _compute_htf_snapshot(df)
+        self.latest_htf_bias = latest_htf.bias
         summary = ProcessSummary(startup=True, latest_htf_bias=latest_htf.bias)
 
         for idx in range(len(history)):
@@ -397,6 +401,9 @@ class SignalService:
             self.config.paper_equity_usd,
             _bias_label(latest_htf.bias),
         )
+        if not self.dry_run:
+            sent = self.telegram.send(self._startup_message(latest_htf))
+            self.logger.info("Startup telegram=%s", "sent" if sent else "failed")
         return summary
 
     def run_once(self) -> ProcessSummary:
@@ -421,6 +428,7 @@ class SignalService:
             full_slice = df.iloc[: pos + 1].reset_index(drop=True)
             window = full_slice.tail(self.config.strategy_bars).reset_index(drop=True)
             htf = _compute_htf_snapshot(full_slice)
+            self.latest_htf_bias = htf.bias
             summary.latest_htf_bias = htf.bias
 
             signals = self.strategy.on_bar_all(window, htf_bias=htf.bias)
@@ -484,6 +492,25 @@ class SignalService:
 
         return summary
 
+    def maybe_send_heartbeat(self, now: datetime | None = None) -> bool:
+        if self.dry_run or not self.bootstrapped:
+            return False
+
+        now_utc = now or datetime.now(UTC)
+        hour_key = now_utc.strftime("%Y-%m-%d %H")
+        if self.last_heartbeat_hour == hour_key:
+            return False
+
+        sent = self.telegram.send(self._heartbeat_message(now_utc))
+        self.last_heartbeat_hour = hour_key
+        self.logger.info(
+            "Heartbeat | ts=%s | htf=%s | telegram=%s",
+            now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            _bias_label(self.latest_htf_bias),
+            "sent" if sent else "failed",
+        )
+        return sent
+
     def stop(self) -> None:
         if not self.dry_run:
             self.telegram.send("Service stopped")
@@ -494,6 +521,30 @@ class SignalService:
         with self.config.csv_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
             writer.writerow(row)
+
+    def _startup_message(self, htf: HTFSnapshot) -> str:
+        return (
+            "🟦 <b>Signal Service started</b>\n\n"
+            f"📊 Symbol: <b>{html.escape(self.config.symbol)}</b>\n"
+            f"⏱️ Interval: <b>{html.escape(self.config.interval)}</b>\n"
+            f"💰 Equity base: <b>{self.config.paper_equity_usd:.2f} USDT</b>\n"
+            f"🧭 HTF bias: <b>{_bias_label(htf.bias)}</b> ({htf.close:.0f} vs EMA50 {htf.ema50:.0f}, {htf.diff_pct:+.2f}%)\n"
+            f"🧱 Warmup bars: <b>{self.config.strategy_bars}</b>\n"
+            f"📨 Heartbeat: <b>every 1 hour</b>\n\n"
+            f"⏰ {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    def _heartbeat_message(self, now_utc: datetime) -> str:
+        return (
+            "💓 <b>Signal Service heartbeat</b>\n\n"
+            f"📊 Symbol: <b>{html.escape(self.config.symbol)}</b>\n"
+            f"⏱️ Interval: <b>{html.escape(self.config.interval)}</b>\n"
+            f"🧭 HTF bias: <b>{_bias_label(self.latest_htf_bias)}</b>\n"
+            f"🪵 Bars processed: <b>{self.total_bars_processed}</b>\n"
+            f"🔔 Signals emitted: <b>{self.total_signals_emitted}</b>\n"
+            f"✅ Status: <b>running</b>\n\n"
+            f"⏰ {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
 
 
 def _load_config() -> ServiceConfig:
@@ -518,6 +569,10 @@ def _sleep_to_next_minute() -> None:
 
 def _should_poll(now: datetime) -> bool:
     return now.minute % 15 == 0 and now.second >= 30
+
+
+def _should_send_heartbeat(now: datetime) -> bool:
+    return now.minute == 0 and now.second >= 30
 
 
 def main() -> int:
@@ -553,6 +608,10 @@ def main() -> int:
     try:
         while not stop_requested:
             now = datetime.now(UTC)
+            if _should_send_heartbeat(now):
+                service.maybe_send_heartbeat(now)
+                time.sleep(31)
+                continue
             if _should_poll(now):
                 summary = service.run_once()
                 if summary.bars_processed:

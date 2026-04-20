@@ -156,10 +156,11 @@ def test_signal_service_end_to_end_writes_csv_and_formats_message(tmp_path, monk
     summary = service.run_once()
 
     assert startup.startup is True
+    assert "Signal Service started" in telegram.messages[0]
     assert summary.signals_emitted == 1
-    assert len(telegram.messages) == 1
-    assert "LONG BTC-USDT 15m" in telegram.messages[0]
-    assert "Sizing sugerido" in telegram.messages[0]
+    assert len(telegram.messages) == 2
+    assert "LONG BTC-USDT 15m" in telegram.messages[1]
+    assert "Sizing sugerido" in telegram.messages[1]
 
     csv_lines = config.csv_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(csv_lines) == 2
@@ -222,4 +223,33 @@ def test_signal_service_is_idempotent_for_same_bar(tmp_path, monkeypatch):
 
     assert first.signals_emitted == 1
     assert second.signals_emitted == 0
-    assert len(telegram.messages) == 1
+    assert len(telegram.messages) == 2
+
+
+def test_signal_service_sends_hourly_heartbeat_once_per_hour(tmp_path):
+    base_df = _make_df(300)
+
+    def fake_fetcher(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+        return base_df.copy()
+
+    config = ServiceConfig(
+        symbol="BTC-USDT",
+        interval="15m",
+        paper_equity_usd=100.0,
+        log_level="INFO",
+        csv_path=tmp_path / "live_signals.csv",
+        log_path=tmp_path / "signal_service.log",
+    )
+    telegram = _FakeTelegram(messages=[])
+    service = SignalService(config, fetcher=fake_fetcher, telegram=telegram, dry_run=False)
+
+    service.bootstrap()
+    first = service.maybe_send_heartbeat(datetime(2026, 4, 20, 12, 5, tzinfo=UTC))
+    second = service.maybe_send_heartbeat(datetime(2026, 4, 20, 12, 35, tzinfo=UTC))
+    third = service.maybe_send_heartbeat(datetime(2026, 4, 20, 13, 1, tzinfo=UTC))
+
+    assert first is True
+    assert second is False
+    assert third is True
+    assert len(telegram.messages) == 3
+    assert "Signal Service heartbeat" in telegram.messages[1]

@@ -29,6 +29,8 @@ python scripts/run_signal_service.py
 
 ## Qué esperar
 - Al arrancar hace un bootstrap silencioso con histórico reciente para reconstruir el estado del strategy.
+- Además envía un mensaje Telegram de arranque confirmando símbolo, timeframe, equity y sesgo HTF.
+- Luego envía un heartbeat cada 1 hora para confirmar que sigue corriendo.
 - En log verás una línea como:
 
 ```text
