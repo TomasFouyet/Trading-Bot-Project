@@ -1,8 +1,9 @@
 version: "3.9"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Trading Bot — full-stack docker-compose
+# Trading Bot — legacy full-stack docker-compose
 # Services: api, worker, redis, postgres, prometheus, grafana
+# For the real 24/7 runner use docker-compose.runner.yml instead.
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-common-env: &common-env

@@ -1,0 +1,1041 @@
+--- validation/fast_backtest.py
++++ app/strategy/trend_following_v2_simple.py
+@@ -1,477 +1,260 @@
+ """
+-Fast vectorized backtester for TrendFollowingV2Simple.
+-
+-Pre-computes all indicators ONCE, then simulates entry/exit logic
+-in a single pass. ~100x faster than bar-by-bar StrategyAdapter.
+-
+-This is specific to the V2Simple entry logic (EMA+ADX+MACD+pullback)
+-with fixed SL/TP exits. Not a general-purpose adapter.
++TrendFollowing V2 Simple — Simplified exit management.
++
++═══════════════════════════════════════════════════════════════════════════════
++IDENTICAL to TrendFollowingV2:
++  - Entry logic: EMA20/50 + ADX + MACD + pullback zone + edge detection
++  - Confidence scoring
++  - Signal cooldown
++
++REMOVED (vs V2):
++  - TP1 partial close / TP2 second target
++  - Move SL to breakeven after TP1
++  - Trailing stop
++  - Tier-based sizing (A/B/C)
++  - Session multiplier / streak adjuster
++  - Reversal swap
++
++REPLACED WITH:
++  - Single fixed SL: atr_sl_mult × ATR below/above entry
++  - Single fixed TP: rr_ratio × SL distance from entry
++  - Full close at TP or SL hit
++  - Fixed position size (confidence=1.0 always)
++
++Tunable params for grid search:
++  - rr_ratio:    reward/risk ratio (default 2.0)
++  - atr_sl_mult: ATR multiplier for SL distance (default 1.5)
++═══════════════════════════════════════════════════════════════════════════════
+ """
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
++from decimal import Decimal
+ from typing import Any
+ 
++import pandas as pd
+ import numpy as np
+-import pandas as pd
+-
+-from validation.strategy_adapter import BacktestMetrics, TradeRecord
+-
+-
+-def compute_indicators(
+-    df: pd.DataFrame,
+-    ema_fast_p: int = 20,
+-    ema_slow_p: int = 50,
+-    slope_bars: int = 5,
+-) -> pd.DataFrame:
+-    """Pre-compute all indicators on the full DataFrame."""
+-    df = df.copy()
+-    close, high, low = df["close"], df["high"], df["low"]
+-
+-    # ATR(14)
+-    tr = pd.concat([
+-        high - low,
+-        (high - close.shift()).abs(),
+-        (low  - close.shift()).abs(),
+-    ], axis=1).max(axis=1)
+-    df["atr"] = tr.ewm(com=13, adjust=False).mean()
+-
+-    # ADX(14)
+-    atr14 = df["atr"]
+-    up   = high.diff()
+-    down = -low.diff()
+-    dm_p = up.where((up > down) & (up > 0), 0.0)
+-    dm_m = down.where((down > up) & (down > 0), 0.0)
+-    di_p = 100 * dm_p.ewm(com=13, adjust=False).mean() / atr14.replace(0, 1e-10)
+-    di_m = 100 * dm_m.ewm(com=13, adjust=False).mean() / atr14.replace(0, 1e-10)
+-    dx   = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, 1e-10)
+-    df["adx"] = dx.ewm(com=13, adjust=False).mean()
+-
+-    # EMAs
+-    df["ema_fast"]       = close.ewm(span=ema_fast_p, adjust=False).mean()
+-    df["ema_slow"]       = close.ewm(span=ema_slow_p, adjust=False).mean()
+-    df["ema_slow_slope"] = df["ema_slow"].diff(slope_bars)
+-    df["ema_fast_slope"] = df["ema_fast"].diff(slope_bars)
+-
+-    # MACD (12, 26, 9)
+-    ema12 = close.ewm(span=12, adjust=False).mean()
+-    ema26 = close.ewm(span=26, adjust=False).mean()
+-    macd  = ema12 - ema26
+-    df["macd"]        = macd
+-    df["macd_signal"] = macd.ewm(span=9, adjust=False).mean()
+-    df["macd_hist"]   = macd - df["macd_signal"]
+-
+-    # Volume SMA
+-    df["vol_sma"] = df["volume"].rolling(20).mean()
+-
+-    return df
+-
+-
+-def compute_htf_bias(
+-    df_15m: pd.DataFrame,
+-    htf_ema_period: int = 50,
+-) -> np.ndarray:
++
++from app.strategy.base import BaseStrategy
++from app.strategy.signals import Signal, SignalAction
++from validation.structural_stop import (
++    build_last_pivot_arrays,
++    compute_pivot_highs,
++    compute_pivot_lows,
++    compute_structural_sl,
++)
++
++
++@dataclass
++class _Trade:
++    """Minimal trade state."""
++    state: int = 0        # 0=flat, 1=long, -1=short
++    entry: float = 0.0
++    sl: float = 0.0
++    tp: float = 0.0
++    start_bar: int = 0
++
++    def is_flat(self) -> bool:
++        return self.state == 0
++
++    def is_long(self) -> bool:
++        return self.state == 1
++
++    def is_short(self) -> bool:
++        return self.state == -1
++
++    def reset(self):
++        self.state = 0
++        self.entry = 0.0
++        self.sl = 0.0
++        self.tp = 0.0
++        self.start_bar = 0
++
++
++def _hold(symbol: str, ts, strategy_id: str, reason: str,
++          meta: dict | None = None) -> Signal:
++    return Signal(
++        action=SignalAction.HOLD, symbol=symbol, ts=ts,
++        strategy_id=strategy_id, reason=reason, meta=meta or {},
++    )
++
++
++class TrendFollowingV2Simple(BaseStrategy):
+     """
+-    Compute 4H trend bias aligned to 15m bars.
+-
+-    Returns array of same length as df_15m:
+-      +1 = bullish (4H close > 4H EMA50)
+-      -1 = bearish (4H close < 4H EMA50)
+-       0 = neutral / not enough data
++    Simplified TrendFollowing — same entries as V2, fixed SL/TP exits.
+     """
+-    # Resample 15m → 4H
+-    df_htf = df_15m.set_index("ts").resample("4h").agg({
+-        "open": "first",
+-        "high": "max",
+-        "low": "min",
+-        "close": "last",
+-        "volume": "sum",
+-    }).dropna()
+-
+-    df_htf["ema_htf"] = df_htf["close"].ewm(span=htf_ema_period, adjust=False).mean()
+-    df_htf["bias"] = 0
+-    df_htf.loc[df_htf["close"] > df_htf["ema_htf"], "bias"] = 1
+-    df_htf.loc[df_htf["close"] < df_htf["ema_htf"], "bias"] = -1
+-
+-    # Forward-fill 4H bias to 15m bars
+-    bias_htf = df_htf[["bias"]].rename(columns={"bias": "htf_bias"})
+-    df_aligned = df_15m[["ts"]].copy().set_index("ts")
+-    df_aligned = df_aligned.join(bias_htf, how="left")
+-    df_aligned["htf_bias"] = df_aligned["htf_bias"].ffill().fillna(0)
+-
+-    return df_aligned["htf_bias"].values.astype(np.int8)
+-
+-
+-def fast_backtest(
+-    df: pd.DataFrame,
+-    adx_min: float = 20.0,
+-    ema_fast_p: int = 20,
+-    ema_slow_p: int = 50,
+-    rr_ratio: float = 2.0,
+-    atr_sl_mult: float = 1.5,
+-    pb_tol_atr: float = 1.0,
+-    sig_cooldown: int = 5,
+-    allow_short: bool = True,
+-    min_confidence: float = 0.0,
+-    adx_strong: float = 35.0,
+-    slope_bars: int = 5,
+-    precomputed: bool = False,
+-    htf_bias: np.ndarray | None = None,
+-    regime_labels: np.ndarray | None = None,
+-    regime_skip: set | None = None,
+-    regime_rr_map: dict | None = None,
+-    # Trailing stop parameters
+-    use_trail: bool = False,
+-    activation_r: float = 0.8,
+-    trail_r: float = 0.5,
+-    # Structural stop parameters (backward-compatible defaults)
+-    stop_mode: str = "ATR",
+-    pivot_left: int = 3,
+-    pivot_right: int = 3,
+-    buffer_atr: float = 0.25,
+-    min_risk_atr: float = 0.8,
+-) -> BacktestMetrics:
+-    """
+-    Run a fast single-pass backtest.
+-
+-    If precomputed=True, assumes df already has indicator columns.
+-
+-    Optional regime parameters:
+-        regime_labels: per-bar regime index (0-3), same length as df
+-        regime_skip: set of regime indices to skip (no entry)
+-        regime_rr_map: dict mapping regime index → rr_ratio override
+-    Otherwise computes them first.
+-    """
+-    if not precomputed:
+-        df = compute_indicators(df, ema_fast_p, ema_slow_p, slope_bars)
+-
+-    min_bars = max(60, ema_slow_p + 20)
+-
+-    # Extract arrays for speed
+-    close  = df["close"].values.astype(np.float64)
+-    high   = df["high"].values.astype(np.float64)
+-    low    = df["low"].values.astype(np.float64)
+-    opn    = df["open"].values.astype(np.float64)
+-    atr    = df["atr"].values.astype(np.float64)
+-    adx    = df["adx"].values.astype(np.float64)
+-    ema_f  = df["ema_fast"].values.astype(np.float64)
+-    ema_s  = df["ema_slow"].values.astype(np.float64)
+-    ema_s_slope = df["ema_slow_slope"].values.astype(np.float64)
+-    ema_f_slope = df["ema_fast_slope"].values.astype(np.float64)
+-    macd_v = df["macd"].values.astype(np.float64)
+-    macd_sig = df["macd_signal"].values.astype(np.float64)
+-    macd_hist = df["macd_hist"].values.astype(np.float64)
+-    volume = df["volume"].values.astype(np.float64)
+-    vol_sma = df["vol_sma"].values.astype(np.float64)
+-    n = len(df)
+-
+-    # ── Structural stop pre-computation (if requested) ───────────────
+-    # When stop_mode="ATR" we skip this entirely → identical to original behavior.
+-    last_pivot_low_arr: np.ndarray | None = None
+-    last_pivot_high_arr: np.ndarray | None = None
+-    if stop_mode != "ATR":
+-        from validation.structural_stop import (
+-            compute_pivot_lows,
+-            compute_pivot_highs,
+-            build_last_pivot_arrays,
+-            compute_structural_sl,
++
++    def __init__(self, symbol: str, params: dict[str, Any] | None = None) -> None:
++        super().__init__(symbol, params)
++
++        # ── Entry parameters (IDENTICAL to V2) ────────────────────────
++        self._adx_min        = float(self.params.get("adx_min",                20.0))
++        self._adx_strong     = float(self.params.get("adx_strong",             35.0))
++        self._ema_fast_p     = int(self.params.get("ema_fast",                   20))
++        self._ema_slow_p     = int(self.params.get("ema_slow",                   50))
++        self._slope_bars     = int(self.params.get("slope_bars",                  5))
++        self._pb_tol_atr     = float(self.params.get("pullback_tolerance_atr",  1.0))
++        self._min_confidence = float(self.params.get("min_confidence",          0.0))
++        self._allow_short    = bool(self.params.get("allow_short",              True))
++        self._sig_cooldown   = int(self.params.get("sig_cooldown",              5))
++
++        # ── Simple exit parameters (NEW) ──────────────────────────────
++        self._rr_ratio       = float(self.params.get("rr_ratio",               2.0))
++        self._atr_sl_mult    = float(self.params.get("atr_sl_mult",            1.5))
++        self._structural_stop_enabled = bool(self.params.get("structural_stop_enabled", True))
++        self._structural_buffer_atr = float(self.params.get("structural_buffer_atr", 0.25))
++        self._structural_min_risk_atr = float(self.params.get("structural_min_risk_atr", 0.8))
++        self._structural_pivot_left = int(self.params.get("structural_pivot_left", 3))
++        self._structural_pivot_right = int(self.params.get("structural_pivot_right", 3))
++
++        # ── Internal state ────────────────────────────────────────────
++        self._trade = _Trade()
++        self._bar_index: int = 0
++        self._last_long_bar:  int = -999
++        self._last_short_bar: int = -999
++        self._prev_long_signal:  bool = False
++        self._prev_short_signal: bool = False
++
++    @property
++    def strategy_id(self) -> str:
++        return (
++            f"trend_v2_simple|adx={self._adx_min}"
++            f"|ema={self._ema_fast_p}/{self._ema_slow_p}"
++            f"|rr={self._rr_ratio}|sl_atr={self._atr_sl_mult}"
+         )
+-        pl_arr = compute_pivot_lows(low, pivot_left, pivot_right)
+-        ph_arr = compute_pivot_highs(high, pivot_left, pivot_right)
+-        last_pivot_low_arr, last_pivot_high_arr = build_last_pivot_arrays(
+-            pl_arr, ph_arr, right=pivot_right
+-        )
+-
+-    # State
+-    trades: list[TradeRecord] = []
+-    in_trade = False
+-    trade_dir = 0   # 1=long, -1=short
+-    entry_price = 0.0
+-    sl_price = 0.0
+-    tp_price = 0.0
+-    sl_dist = 0.0   # absolute SL distance for R-unit calculations
+-    entry_bar = 0
+-    last_sl_mode = "atr"
+-    last_conf = 0.0
+-
+-    # Trailing stop state
+-    trail_active = False
+-    trail_stop = 0.0
+-    peak_favorable = 0.0
+-
+-    prev_long_sig = False
+-    prev_short_sig = False
+-    last_long_bar = -999
+-    last_short_bar = -999
+-
+-    for i in range(min_bars, n):
+-        c = close[i]
+-        h = high[i]
+-        lo = low[i]
+-        a = atr[i]
+-        dx = adx[i]
+-
+-        if np.isnan(dx) or np.isnan(ema_s[i]) or a <= 0:
+-            continue
+-
+-        # ── Check exits first ─────────────────────────────────────
+-        if in_trade:
+-            # -- Trailing stop logic (only when use_trail=True) --
+-            trail_exit = False
+-            trail_exit_price = 0.0
+-
+-            if use_trail and sl_dist > 0:
+-                # Update peak favorable price
+-                if trade_dir == 1:
+-                    peak_favorable = max(peak_favorable, h)
+-                else:
+-                    peak_favorable = min(peak_favorable, lo)
+-
+-                # Compute MFE in R units
+-                if trade_dir == 1:
+-                    mfe_r = (peak_favorable - entry_price) / sl_dist
+-                else:
+-                    mfe_r = (entry_price - peak_favorable) / sl_dist
+-
+-                # Activate trail if threshold reached
+-                if not trail_active and mfe_r >= activation_r:
+-                    trail_active = True
+-                    if trade_dir == 1:
+-                        trail_stop = peak_favorable - trail_r * sl_dist
+-                    else:
+-                        trail_stop = peak_favorable + trail_r * sl_dist
+-
+-                # Ratchet trail stop (only moves in favorable direction)
+-                if trail_active:
+-                    if trade_dir == 1:
+-                        new_trail = peak_favorable - trail_r * sl_dist
+-                        trail_stop = max(trail_stop, new_trail)
+-                        # Trail can never be worse than original SL
+-                        trail_stop = max(trail_stop, sl_price)
+-                    else:
+-                        new_trail = peak_favorable + trail_r * sl_dist
+-                        trail_stop = min(trail_stop, new_trail)
+-                        trail_stop = min(trail_stop, sl_price)
+-
+-                    # Check trail stop hit
+-                    if trade_dir == 1 and lo <= trail_stop:
+-                        trail_exit = True
+-                        trail_exit_price = trail_stop
+-                    elif trade_dir == -1 and h >= trail_stop:
+-                        trail_exit = True
+-                        trail_exit_price = trail_stop
+-
+-            # -- Regular SL/TP check --
+-            sl_hit = (trade_dir == 1 and lo <= sl_price) or \
+-                     (trade_dir == -1 and h >= sl_price)
+-            tp_hit = (trade_dir == 1 and h >= tp_price) or \
+-                     (trade_dir == -1 and lo <= tp_price)
+-
+-            # Priority: TP > trail > SL
+-            # (TP is best for trader; trail is better than SL)
+-            if tp_hit:
+-                pnl = _pnl(trade_dir, entry_price, tp_price)
+-                trades.append(TradeRecord(
+-                    direction="LONG" if trade_dir == 1 else "SHORT",
+-                    entry_price=entry_price,
+-                    exit_price=tp_price,
+-                    pnl_pct=pnl,
+-                    exit_type="tp",
+-                    bars_held=i - entry_bar,
+-                    entry_bar_idx=entry_bar,
+-                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
+-                ))
+-                in_trade = False
+-                trail_active = False
+-                continue
+-            elif trail_exit:
+-                pnl = _pnl(trade_dir, entry_price, trail_exit_price)
+-                trades.append(TradeRecord(
+-                    direction="LONG" if trade_dir == 1 else "SHORT",
+-                    entry_price=entry_price,
+-                    exit_price=trail_exit_price,
+-                    pnl_pct=pnl,
+-                    exit_type="trail",
+-                    bars_held=i - entry_bar,
+-                    entry_bar_idx=entry_bar,
+-                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
+-                ))
+-                in_trade = False
+-                trail_active = False
+-                continue
+-            elif sl_hit:
+-                pnl = _pnl(trade_dir, entry_price, sl_price)
+-                trades.append(TradeRecord(
+-                    direction="LONG" if trade_dir == 1 else "SHORT",
+-                    entry_price=entry_price,
+-                    exit_price=sl_price,
+-                    pnl_pct=pnl,
+-                    exit_type="sl",
+-                    bars_held=i - entry_bar,
+-                    entry_bar_idx=entry_bar,
+-                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
+-                ))
+-                in_trade = False
+-                trail_active = False
+-                continue
+-
+-        # ── Entry conditions (IDENTICAL to V2) ────────────────────
+-        pb_zone    = abs(c - ema_f[i]) < a * pb_tol_atr
+-        sl_rising  = ema_s_slope[i] > 0 if not np.isnan(ema_s_slope[i]) else False
+-        sl_falling = ema_s_slope[i] < 0 if not np.isnan(ema_s_slope[i]) else False
+-        p_above    = c > ema_s[i]
+-        p_below    = c < ema_s[i]
+-        m_bull     = macd_v[i] > macd_sig[i]
+-        m_bear     = macd_v[i] < macd_sig[i]
+-        c_bull     = c > opn[i]
+-        c_bear     = c < opn[i]
+-        adx_ok     = dx >= adx_min
+-
+-        long_base  = adx_ok and sl_rising and p_above and m_bull and pb_zone and c_bull
+-        short_base = adx_ok and sl_falling and p_below and m_bear and pb_zone and c_bear and allow_short
+-
+-        # Confidence (simplified — just check min_confidence gate)
+-        conf_l = _fast_confidence(dx, adx_strong, a, c, ema_f[i],
+-                                  macd_hist[i], macd_hist[i-1] if i > 0 else 0,
+-                                  "LONG", opn[i], h, lo,
+-                                  ema_f_slope[i], volume[i], vol_sma[i]) if long_base else 0.0
+-        conf_s = _fast_confidence(dx, adx_strong, a, c, ema_f[i],
+-                                  macd_hist[i], macd_hist[i-1] if i > 0 else 0,
+-                                  "SHORT", opn[i], h, lo,
+-                                  ema_f_slope[i], volume[i], vol_sma[i]) if short_base else 0.0
+-
+-        long_signal  = long_base  and conf_l >= min_confidence
+-        short_signal = short_base and conf_s >= min_confidence
+-
+-        # Edge detection
+-        long_trigger_raw  = long_signal  and not prev_long_sig
+-        short_trigger_raw = short_signal and not prev_short_sig
+-        prev_long_sig  = long_signal
+-        prev_short_sig = short_signal
+-
+-        # Cooldown
+-        long_trigger  = long_trigger_raw  and (i - last_long_bar)  >= sig_cooldown
+-        short_trigger = short_trigger_raw and (i - last_short_bar) >= sig_cooldown
+-        if long_trigger:
+-            last_long_bar = i
+-        if short_trigger:
+-            last_short_bar = i
+-
+-        # ── HTF filter (if provided) ─────────────────────────────
+-        if htf_bias is not None:
+-            bias = htf_bias[i]
+-            if long_trigger and bias == -1:
+-                long_trigger = False   # skip LONG when HTF bearish
+-            if short_trigger and bias == 1:
+-                short_trigger = False  # skip SHORT when HTF bullish
+-
+-        # ── Regime filter (if provided) ──────────────────────────
+-        if regime_labels is not None and (long_trigger or short_trigger):
+-            bar_regime = regime_labels[i]
+-            if regime_skip and bar_regime in regime_skip:
+-                long_trigger = False
+-                short_trigger = False
+-
+-        # ── Open trade if flat ────────────────────────────────────
+-        if not in_trade:
+-            # Determine rr for this trade (regime override or default)
+-            effective_rr = rr_ratio
+-            if regime_rr_map is not None and regime_labels is not None:
+-                bar_regime = regime_labels[i]
+-                if bar_regime in regime_rr_map:
+-                    effective_rr = regime_rr_map[bar_regime]
+-
+-            if long_trigger:
+-                entry_price = c
+-                last_conf = conf_l
+-                if stop_mode == "ATR" or last_pivot_low_arr is None:
+-                    sl_price = c - a * atr_sl_mult
+-                    last_sl_mode = "atr"
+-                else:
+-                    sl_price, last_sl_mode = compute_structural_sl(
+-                        entry_price=c, direction="LONG", bar_idx=i,
+-                        last_pivot_low=last_pivot_low_arr,
+-                        last_pivot_high=last_pivot_high_arr,
+-                        atr=a, stop_mode=stop_mode,
+-                        atr_sl_mult=atr_sl_mult,
+-                        buffer_atr=buffer_atr, min_risk_atr=min_risk_atr,
+-                    )
+-                sl_dist = abs(entry_price - sl_price)
+-                tp_price = entry_price + sl_dist * effective_rr
+-                trade_dir = 1
+-                entry_bar = i
+-                in_trade = True
+-                trail_active = False
+-                trail_stop = 0.0
+-                peak_favorable = c
+-            elif short_trigger:
+-                entry_price = c
+-                last_conf = conf_s
+-                if stop_mode == "ATR" or last_pivot_high_arr is None:
+-                    sl_price = c + a * atr_sl_mult
+-                    last_sl_mode = "atr"
+-                else:
+-                    sl_price, last_sl_mode = compute_structural_sl(
+-                        entry_price=c, direction="SHORT", bar_idx=i,
+-                        last_pivot_low=last_pivot_low_arr,
+-                        last_pivot_high=last_pivot_high_arr,
+-                        atr=a, stop_mode=stop_mode,
+-                        atr_sl_mult=atr_sl_mult,
+-                        buffer_atr=buffer_atr, min_risk_atr=min_risk_atr,
+-                    )
+-                sl_dist = abs(sl_price - entry_price)
+-                tp_price = entry_price - sl_dist * effective_rr
+-                trade_dir = -1
+-                entry_bar = i
+-                in_trade = True
+-                trail_active = False
+-                trail_stop = 0.0
+-                peak_favorable = c
+-
+-    # Close open trade at end
+-    if in_trade:
+-        pnl = _pnl(trade_dir, entry_price, close[-1])
+-        trades.append(TradeRecord(
+-            direction="LONG" if trade_dir == 1 else "SHORT",
+-            entry_price=entry_price,
+-            exit_price=float(close[-1]),
+-            pnl_pct=pnl,
+-            exit_type="end_of_data",
+-            bars_held=n - 1 - entry_bar,
+-            entry_bar_idx=entry_bar,
+-            sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
+-        ))
+-
+-    return _build_metrics(trades, df)
+-
+-
+-def _pnl(direction: int, entry: float, exit_p: float) -> float:
+-    if direction == 1:
+-        return (exit_p - entry) / entry * 100
+-    else:
+-        return (entry - exit_p) / entry * 100
+-
+-
+-def _fast_confidence(
+-    adx: float, adx_strong: float, atr: float, close: float, ema_f: float,
+-    hist: float, prev_hist: float, direction: str,
+-    opn: float, high: float, low: float,
+-    ema_f_slope: float, volume: float, vol_sma: float,
+-) -> float:
+-    """Fast confidence scoring — identical logic to V2."""
+-    sc = 0.0
+-
+-    if adx >= adx_strong:
+-        sc += 0.20
+-    elif adx >= 30:
+-        sc += 0.10
+-
+-    pb_atr = abs(close - ema_f) / atr if atr > 0 else 999
+-    if pb_atr <= 0.5:
+-        sc += 0.20
+-    elif pb_atr <= 1.0:
+-        sc += 0.10
+-
+-    if not np.isnan(hist) and not np.isnan(prev_hist):
++
++    @property
++    def min_bars_required(self) -> int:
++        return max(60, self._ema_slow_p + 20)
++
++    @property
++    def engine_manages_sl_tp(self) -> bool:
++        return False
++
++    def force_close(self) -> None:
++        """Reset runtime trade state."""
++        self._trade.reset()
++
++    def export_runtime_state(self) -> dict[str, Any]:
++        """Persist minimal runtime state needed for crash recovery."""
++        return {
++            "bar_index": self._bar_index,
++            "last_long_bar": self._last_long_bar,
++            "last_short_bar": self._last_short_bar,
++            "prev_long_signal": self._prev_long_signal,
++            "prev_short_signal": self._prev_short_signal,
++            "trade": {
++                "state": self._trade.state,
++                "entry": self._trade.entry,
++                "sl": self._trade.sl,
++                "tp": self._trade.tp,
++                "start_bar": self._trade.start_bar,
++            },
++        }
++
++    def restore_runtime_state(self, state: dict[str, Any] | None) -> None:
++        """Restore strategy runtime state after crash recovery."""
++        if not state:
++            return
++        self._bar_index = int(state.get("bar_index", self._bar_index))
++        self._last_long_bar = int(state.get("last_long_bar", self._last_long_bar))
++        self._last_short_bar = int(state.get("last_short_bar", self._last_short_bar))
++        self._prev_long_signal = bool(state.get("prev_long_signal", self._prev_long_signal))
++        self._prev_short_signal = bool(state.get("prev_short_signal", self._prev_short_signal))
++
++        trade = state.get("trade") or {}
++        self._trade.state = int(trade.get("state", 0))
++        self._trade.entry = float(trade.get("entry", 0.0))
++        self._trade.sl = float(trade.get("sl", 0.0))
++        self._trade.tp = float(trade.get("tp", 0.0))
++        self._trade.start_bar = int(trade.get("start_bar", 0))
++
++    def restore_open_trade(
++        self,
++        *,
++        side: str,
++        entry_price: float,
++        stop_loss: float,
++        take_profit: float,
++        start_bar: int | None = None,
++    ) -> None:
++        """Rebuild runtime trade state from a persisted open trade."""
++        self._trade.state = 1 if side == "LONG" else -1
++        self._trade.entry = float(entry_price)
++        self._trade.sl = float(stop_loss)
++        self._trade.tp = float(take_profit)
++        self._trade.start_bar = int(start_bar if start_bar is not None else self._bar_index)
++
++    # ══════════════════════════════════════════════════════════════════
++    # INDICATORS — copied verbatim from V2
++    # ══════════════════════════════════════════════════════════════════
++
++    def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
++        df = df.copy()
++        close, high, low = df["close"], df["high"], df["low"]
++
++        # ATR(14)
++        tr = pd.concat([
++            high - low,
++            (high - close.shift()).abs(),
++            (low  - close.shift()).abs(),
++        ], axis=1).max(axis=1)
++        df["atr"] = tr.ewm(com=13, adjust=False).mean()
++
++        # ADX(14)
++        atr14 = df["atr"]
++        up   = high.diff()
++        down = -low.diff()
++        dm_p = up.where((up > down) & (up > 0), 0.0)
++        dm_m = down.where((down > up) & (down > 0), 0.0)
++        di_p = 100 * dm_p.ewm(com=13, adjust=False).mean() / atr14.replace(0, 1e-10)
++        di_m = 100 * dm_m.ewm(com=13, adjust=False).mean() / atr14.replace(0, 1e-10)
++        dx   = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, 1e-10)
++        df["adx"] = dx.ewm(com=13, adjust=False).mean()
++
++        # EMAs
++        df["ema_fast"]       = close.ewm(span=self._ema_fast_p, adjust=False).mean()
++        df["ema_slow"]       = close.ewm(span=self._ema_slow_p, adjust=False).mean()
++        df["ema_slow_slope"] = df["ema_slow"].diff(self._slope_bars)
++        df["ema_fast_slope"] = df["ema_fast"].diff(self._slope_bars)
++
++        # MACD (12, 26, 9)
++        ema12 = close.ewm(span=12, adjust=False).mean()
++        ema26 = close.ewm(span=26, adjust=False).mean()
++        macd  = ema12 - ema26
++        df["macd"]        = macd
++        df["macd_signal"] = macd.ewm(span=9, adjust=False).mean()
++        df["macd_hist"]   = macd - df["macd_signal"]
++
++        # Volume SMA
++        df["vol_sma"] = df["volume"].rolling(20).mean()
++
++        return df
++
++    # ══════════════════════════════════════════════════════════════════
++    # CONFIDENCE — copied verbatim from V2
++    # ══════════════════════════════════════════════════════════════════
++
++    def _compute_confidence(self, row: pd.Series, df: pd.DataFrame,
++                            direction: str) -> float:
++        sc = 0.0
++
++        adx = float(row["adx"]) if not pd.isna(row["adx"]) else 0
++        if adx >= self._adx_strong:
++            sc += 0.20
++        elif adx >= 30:
++            sc += 0.10
++
++        atr = float(row["atr"]) if not pd.isna(row["atr"]) else 1e-10
++        ema_f = float(row["ema_fast"])
++        pb_atr = abs(float(row["close"]) - ema_f) / atr if atr > 0 else 999
++        if pb_atr <= 0.5:
++            sc += 0.20
++        elif pb_atr <= 1.0:
++            sc += 0.10
++
++        hist = float(row["macd_hist"]) if not pd.isna(row["macd_hist"]) else 0
++        prev_hist = float(df["macd_hist"].iloc[-2]) if len(df) >= 2 and not pd.isna(df["macd_hist"].iloc[-2]) else 0
+         if direction == "LONG" and hist > 0 and hist > prev_hist:
+             sc += 0.15
+         elif direction == "SHORT" and hist < 0 and hist < prev_hist:
+@@ -479,69 +262,249 @@
+         elif (direction == "LONG" and hist > 0) or (direction == "SHORT" and hist < 0):
+             sc += 0.05
+ 
+-    body = abs(close - opn)
+-    rng = high - low
+-    ratio = body / rng if rng > 0 else 0
+-    if ratio >= 0.60:
+-        sc += 0.15
+-    elif ratio >= 0.40:
+-        sc += 0.07
+-
+-    if not np.isnan(ema_f_slope):
+-        if direction == "LONG" and ema_f_slope > 0:
++        body = abs(float(row["close"]) - float(row["open"]))
++        rng  = float(row["high"]) - float(row["low"])
++        ratio = body / rng if rng > 0 else 0
++        if ratio >= 0.60:
+             sc += 0.15
+-        elif direction == "SHORT" and ema_f_slope < 0:
++        elif ratio >= 0.40:
++            sc += 0.07
++
++        efs = float(row["ema_fast_slope"]) if not pd.isna(row["ema_fast_slope"]) else 0
++        if direction == "LONG" and efs > 0:
+             sc += 0.15
+-
+-    vol_r = volume / vol_sma if vol_sma > 0 and not np.isnan(vol_sma) else 0
+-    if vol_r >= 1.2:
+-        sc += 0.15
+-    elif vol_r >= 0.8:
+-        sc += 0.05
+-
+-    return min(sc, 1.0)
+-
+-
+-def _build_metrics(trades: list[TradeRecord], df: pd.DataFrame) -> BacktestMetrics:
+-    """Build BacktestMetrics from trade list."""
+-    m = BacktestMetrics()
+-    m.trades = [t.to_dict() for t in trades]
+-    m.total_trades = len(trades)
+-
+-    if not trades:
+-        return m
+-
+-    pnls = np.array([t.pnl_pct for t in trades])
+-    m.winning_trades = int(np.sum(pnls > 0))
+-    m.losing_trades = int(np.sum(pnls <= 0))
+-    m.winrate = m.winning_trades / m.total_trades * 100
+-    m.total_pnl_pct = float(np.sum(pnls))
+-    m.avg_pnl_pct = float(np.mean(pnls))
+-
+-    # Equity curve & drawdown (compounded)
+-    mult = 1.0 + pnls / 100.0
+-    equity = np.concatenate([[1.0], np.cumprod(mult)])
+-    running_max = np.maximum.accumulate(equity)
+-    drawdowns = (equity - running_max) / running_max  # percentage DD
+-    m.max_drawdown_pct = abs(float(np.min(drawdowns))) * 100
+-
+-    # Annualized return (compounded)
+-    ts_start = pd.Timestamp(df["ts"].iloc[0])
+-    ts_end = pd.Timestamp(df["ts"].iloc[-1])
+-    days = max((ts_end - ts_start).total_seconds() / 86400, 1)
+-    total_return = equity[-1] / equity[0]  # uses compounded equity from DD calc
+-    m.annual_return_pct = (total_return ** (365.0 / days) - 1) * 100
+-
+-    # Sharpe
+-    if len(pnls) >= 2:
+-        mean_r = np.mean(pnls)
+-        std_r = np.std(pnls, ddof=1)
+-        if std_r > 0:
+-            avg_bars = np.mean([t.bars_held for t in trades])
+-            delta = (pd.Timestamp(df["ts"].iloc[1]) - pd.Timestamp(df["ts"].iloc[0])).total_seconds()
+-            tf_min = max(delta / 60, 1)
+-            bars_per_year = 365 * 24 * 60 / tf_min
+-            trades_per_year = bars_per_year / max(avg_bars, 1)
+-            m.sharpe_ratio = float((mean_r / std_r) * np.sqrt(trades_per_year))
+-
+-    return m
++        elif direction == "SHORT" and efs < 0:
++            sc += 0.15
++
++        vol     = float(row["volume"]) if not pd.isna(row["volume"]) else 0
++        vol_sma = float(row["vol_sma"]) if not pd.isna(row["vol_sma"]) else 1
++        vol_r   = vol / vol_sma if vol_sma > 0 else 0
++        if vol_r >= 1.2:
++            sc += 0.15
++        elif vol_r >= 0.8:
++            sc += 0.05
++
++        return round(min(sc, 1.0), 3)
++
++    # ══════════════════════════════════════════════════════════════════
++    # MAIN: on_bar_all() — simplified state machine
++    # ══════════════════════════════════════════════════════════════════
++
++    def on_bar_all(self, df: pd.DataFrame, htf_bias=None) -> list[Signal]:
++        self._bar_index += 1
++        ts = df["ts"].iloc[-1]
++        if hasattr(ts, "to_pydatetime"):
++            ts = ts.to_pydatetime()
++
++        if len(df) < self.min_bars_required:
++            return [_hold(self.symbol, ts, self.strategy_id, "warmup")]
++
++        df = self._compute_indicators(df)
++        row = df.iloc[-1]
++
++        if pd.isna(row["adx"]) or pd.isna(row["ema_slow"]):
++            return [_hold(self.symbol, ts, self.strategy_id, "indicators_not_ready")]
++
++        close = float(row["close"])
++        high  = float(row["high"])
++        low   = float(row["low"])
++        atr   = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
++        adx   = float(row["adx"])
++        ema_f = float(row["ema_fast"])
++        ema_s = float(row["ema_slow"])
++
++        ind: dict = {
++            "adx": round(adx, 2),
++            "atr": round(atr, 6),
++            "ema_fast": round(ema_f, 4),
++            "ema_slow": round(ema_s, 4),
++        }
++
++        # ── STEP 1: Setup conditions (IDENTICAL to V2) ───────────────
++        pb_zone    = abs(close - ema_f) < atr * self._pb_tol_atr if atr > 0 else False
++        sl_rising  = float(row["ema_slow_slope"]) > 0 if not pd.isna(row["ema_slow_slope"]) else False
++        sl_falling = float(row["ema_slow_slope"]) < 0 if not pd.isna(row["ema_slow_slope"]) else False
++        p_above    = close > ema_s
++        p_below    = close < ema_s
++        m_bull     = float(row["macd"]) > float(row["macd_signal"])
++        m_bear     = float(row["macd"]) < float(row["macd_signal"])
++        c_bull     = close > float(row["open"])
++        c_bear     = close < float(row["open"])
++        adx_ok     = adx >= self._adx_min
++
++        long_base  = adx_ok and sl_rising  and p_above and m_bull and pb_zone and c_bull
++        short_base = adx_ok and sl_falling and p_below and m_bear and pb_zone and c_bear and self._allow_short
++
++        # ── Confidence (IDENTICAL to V2, but no tier/sizing) ──────────
++        conf_long  = self._compute_confidence(row, df, "LONG") if long_base else 0.0
++        conf_short = self._compute_confidence(row, df, "SHORT") if short_base else 0.0
++
++        long_signal  = long_base  and conf_long  >= self._min_confidence
++        short_signal = short_base and conf_short >= self._min_confidence
++
++        # ── Edge detection (IDENTICAL to V2) ──────────────────────────
++        long_trigger_raw  = long_signal  and not self._prev_long_signal
++        short_trigger_raw = short_signal and not self._prev_short_signal
++        self._prev_long_signal  = long_signal
++        self._prev_short_signal = short_signal
++
++        # ── Cooldown (IDENTICAL to V2) ────────────────────────────────
++        long_trigger  = long_trigger_raw  and (self._bar_index - self._last_long_bar)  >= self._sig_cooldown
++        short_trigger = short_trigger_raw and (self._bar_index - self._last_short_bar) >= self._sig_cooldown
++        if long_trigger:
++            self._last_long_bar = self._bar_index
++        if short_trigger:
++            self._last_short_bar = self._bar_index
++
++        signals: list[Signal] = []
++
++        # ── STEP 2: Check exits for open trade (SIMPLIFIED) ──────────
++        if not self._trade.is_flat():
++            exit_sig = self._check_exit(ts, high, low, close, ind)
++            if exit_sig:
++                signals.append(exit_sig)
++
++        # ── STEP 3: Open new trade if flat (NO reversal swap) ────────
++        if self._trade.is_flat() and (long_trigger or short_trigger):
++            direction = "LONG" if long_trigger else "SHORT"
++            try:
++                sl, tp, sl_mode = self._compute_entry_levels(df, close, atr, direction)
++            except ValueError:
++                return [_hold(self.symbol, ts, self.strategy_id, "invalid_entry_levels", meta=ind)]
++            signals.append(self._open_trade(ts, close, sl, tp, direction, ind, sl_mode))
++
++        if not signals:
++            return [_hold(self.symbol, ts, self.strategy_id, "no_setup", meta=ind)]
++
++        return signals
++
++    def on_bar(self, df: pd.DataFrame, htf_bias=None) -> Signal:
++        sigs = self.on_bar_all(df, htf_bias=htf_bias)
++        return sigs[0] if sigs else _hold(
++            self.symbol, df["ts"].iloc[-1], self.strategy_id, "no_signal")
++
++    # ══════════════════════════════════════════════════════════════════
++    # EXIT: single SL or single TP, full close
++    # ══════════════════════════════════════════════════════════════════
++
++    def _check_exit(self, ts, bar_high: float, bar_low: float,
++                    bar_close: float, ind: dict) -> Signal | None:
++        t = self._trade
++
++        # SL hit (priority over TP — same bar, SL wins)
++        sl_hit = (t.is_long() and bar_low <= t.sl) or \
++                 (t.is_short() and bar_high >= t.sl)
++
++        if sl_hit:
++            exit_price = t.sl
++            pnl = self._pnl_pct(exit_price)
++            self._trade.reset()
++            return Signal(
++                action=SignalAction.CLOSE,
++                symbol=self.symbol, ts=ts,
++                strategy_id=self.strategy_id,
++                reason=f"sl_hit|pnl={pnl:+.2f}%",
++                meta={**ind, "exit_type": "sl", "exit_price": exit_price, "pnl_pct": pnl},
++            )
++
++        # TP hit
++        tp_hit = (t.is_long() and bar_high >= t.tp) or \
++                 (t.is_short() and bar_low <= t.tp)
++
++        if tp_hit:
++            exit_price = t.tp
++            pnl = self._pnl_pct(exit_price)
++            self._trade.reset()
++            return Signal(
++                action=SignalAction.CLOSE,
++                symbol=self.symbol, ts=ts,
++                strategy_id=self.strategy_id,
++                reason=f"tp_hit|pnl={pnl:+.2f}%",
++                meta={**ind, "exit_type": "tp", "exit_price": exit_price, "pnl_pct": pnl},
++            )
++
++        return None
++
++    # ══════════════════════════════════════════════════════════════════
++    # OPEN TRADE — fixed size, no tiers
++    # ══════════════════════════════════════════════════════════════════
++
++    def _compute_entry_levels(
++        self,
++        df: pd.DataFrame,
++        close: float,
++        atr: float,
++        direction: str,
++    ) -> tuple[float, float, str]:
++        """Return official (stop_loss, take_profit, sl_mode) for a new trade."""
++        if atr <= 0:
++            raise ValueError("ATR must be positive to compute entry levels")
++
++        stop_mode = "STRUCTURAL" if self._structural_stop_enabled else "ATR"
++        lows = df["low"].astype(float).to_numpy(dtype=float)
++        highs = df["high"].astype(float).to_numpy(dtype=float)
++        pivot_lows = compute_pivot_lows(
++            lows, left=self._structural_pivot_left, right=self._structural_pivot_right
++        )
++        pivot_highs = compute_pivot_highs(
++            highs, left=self._structural_pivot_left, right=self._structural_pivot_right
++        )
++        last_pivot_low, last_pivot_high = build_last_pivot_arrays(
++            pivot_lows, pivot_highs, right=self._structural_pivot_right
++        )
++        stop_loss, sl_mode = compute_structural_sl(
++            entry_price=close,
++            direction=direction,
++            bar_idx=len(df) - 1,
++            last_pivot_low=last_pivot_low,
++            last_pivot_high=last_pivot_high,
++            atr=atr,
++            stop_mode=stop_mode,
++            atr_sl_mult=self._atr_sl_mult,
++            buffer_atr=self._structural_buffer_atr,
++            min_risk_atr=self._structural_min_risk_atr,
++        )
++        risk = abs(close - stop_loss)
++        if risk <= 0:
++            raise ValueError("Structural stop produced zero risk distance")
++        take_profit = close + risk * self._rr_ratio if direction == "LONG" else close - risk * self._rr_ratio
++        return float(stop_loss), float(take_profit), sl_mode
++
++    def _open_trade(self, ts, close: float, sl: float, tp: float,
++                    direction: str, ind: dict, sl_mode: str) -> Signal:
++        self._trade.state = 1 if direction == "LONG" else -1
++        self._trade.entry = close
++        self._trade.sl = sl
++        self._trade.tp = tp
++        self._trade.start_bar = self._bar_index
++
++        action = SignalAction.BUY if direction == "LONG" else SignalAction.SELL
++        risk = abs(close - sl)
++
++        return Signal(
++            action=action,
++            symbol=self.symbol, ts=ts,
++            strategy_id=self.strategy_id,
++            confidence=1.0,  # fixed size
++            stop_loss=Decimal(str(round(sl, 8))),
++            take_profit=Decimal(str(round(tp, 8))),
++            reason=f"trend_{direction.lower()}|rr={self._rr_ratio}|sl_atr={self._atr_sl_mult}",
++            meta={
++                **ind,
++                "sl": round(sl, 8),
++                "tp1": round(tp, 8),
++                "tp2": round(tp, 8),
++                "exit_type": "",
++                "rr_ratio": self._rr_ratio,
++                "atr_sl_mult": self._atr_sl_mult,
++                "risk": round(risk, 8),
++                "sl_mode": sl_mode,
++            },
++        )
++
++    def _pnl_pct(self, exit_price: float) -> float:
++        t = self._trade
++        if t.is_long():
++            return (exit_price - t.entry) / t.entry * 100
++        else:
++            return (t.entry - exit_price) / t.entry * 100

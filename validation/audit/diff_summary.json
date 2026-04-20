@@ -1,0 +1,87 @@
+{
+  "total_python": 6,
+  "total_pine": 14,
+  "total_match": 5,
+  "match_rate": 35.714285714285715,
+  "divergences": {
+    "PYTHON_ONLY": 1,
+    "PINE_ONLY": 9,
+    "TYPE_MISMATCH": 0
+  },
+  "top_causes": [
+    [
+      "ghost_trade_after_htf_rejection",
+      9
+    ],
+    [
+      "htf_alignment",
+      1
+    ]
+  ],
+  "indicator_diff_summary": {
+    "atr_rel_pct": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "adx_abs": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "ema20_rel_pct": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "ema50_rel_pct": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "macd_line_rel_pct": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "macd_signal_rel_pct": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "macd_hist_rel_pct": {
+      "avg": 0.0,
+      "max": 0.0,
+      "p95": 0.0
+    },
+    "sl_rel_pct": {
+      "avg": 1.7399693614994535e-12,
+      "max": 5.20444759886904e-12,
+      "p95": 4.665820503004309e-12
+    },
+    "tp_rel_pct": {
+      "avg": 8.649750684299343e-13,
+      "max": 1.4081396407344304e-12,
+      "p95": 1.4073616332386112e-12
+    },
+    "htf_bias_match": {
+      "avg": 1.0,
+      "max": 1.0,
+      "p95": 1.0
+    }
+  },
+  "diagnostics": [
+    "Bar 82 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL.",
+    "Bar 346 - PINE_ONLY SHORT: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BEAR.",
+    "Bar 536 - PINE_ONLY SHORT: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BEAR.",
+    "Bar 749 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL.",
+    "Bar 1254 - PYTHON_ONLY LONG: Pine rejected because htf_alignment. Pine HTF=BEAR.",
+    "Bar 1443 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL.",
+    "Bar 1526 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL.",
+    "Bar 1548 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL.",
+    "Bar 1622 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL.",
+    "Bar 1954 - PINE_ONLY LONG: Python rejected because ghost_trade_after_htf_rejection. Python HTF=BULL."
+  ],
+  "verdict": "RESET_REQUERIDO",
+  "recommendation": "Pausar paper trading y revisar arquitectura/contrato de senales antes de seguir."
+}

@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      RUNNER_HEARTBEAT_FILE: /app/data/runner_heartbeat.json
+      RUNNER_HEARTBEAT_MAX_AGE_SECONDS: "180"
+    command:
+      - python
+      - scripts/run_simple_paper.py
+      - --headless
+      - --symbol
+      - BTC
+      - --timeframe
+      - 15m
+      - --balance
+      - "100"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "scripts/check_runner_health.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

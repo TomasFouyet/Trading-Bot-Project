@@ -1,0 +1,1 @@
+"""Canonical strategy audit artifacts."""

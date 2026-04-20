@@ -14,6 +14,7 @@ BingX API reference:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import random
@@ -178,6 +179,11 @@ class BingXClient:
     def _leverage_path(self) -> str:
         return "/openApi/swap/v2/trade/leverage"
 
+    def _open_orders_path(self) -> str:
+        if self._market_type == MarketType.SWAP:
+            return "/openApi/swap/v2/trade/openOrders"
+        return "/openApi/spot/v1/trade/openOrders"
+
     # ── HTTP core ─────────────────────────────────────────────────────────────
 
     async def _request(
@@ -262,14 +268,14 @@ class BingXClient:
                     raise
                 sleep = delay + random.uniform(0, 0.5)
                 logger.warning("rate_limit_backoff", attempt=attempt, sleep_s=sleep, path=path)
-                time.sleep(sleep)
+                await asyncio.sleep(sleep)
                 last_exc = RateLimitError(f"Rate limited after {attempt} attempts")
             except BrokerError as e:
                 if attempt == len(delays):
                     raise
                 sleep = delay + random.uniform(0, 0.3)
                 logger.warning("broker_retry", attempt=attempt, error=str(e), path=path)
-                time.sleep(sleep)
+                await asyncio.sleep(sleep)
                 last_exc = e
         raise last_exc  # type: ignore[misc]
 
@@ -422,6 +428,21 @@ class BingXClient:
         )
         if isinstance(data, dict) and "balance" in data:
             return [data["balance"]] if isinstance(data["balance"], dict) else data["balance"]
+        return data if isinstance(data, list) else []
+
+    async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = normalize_symbol(symbol)
+        data = await self._request_with_retry(
+            "GET", self._open_orders_path(), params=params, signed=True
+        )
+        if isinstance(data, dict):
+            for key in ("orders", "openOrders", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return value
+            return []
         return data if isinstance(data, list) else []
 
     async def get_contracts(self) -> list[dict]:

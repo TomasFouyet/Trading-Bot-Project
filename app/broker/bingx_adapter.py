@@ -159,6 +159,9 @@ class BingXAdapter(BrokerAdapter):
             )
         return balances
 
+    async def get_open_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        return await self._client.get_open_orders(symbol)
+
     async def fetch_ohlcv(
         self,
         symbol: str,

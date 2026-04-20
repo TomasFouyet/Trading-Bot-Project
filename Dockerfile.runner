@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+COPY validation/ ./validation/
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -e ".[dev]"
+
+RUN mkdir -p /app/data/parquet /app/data
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
+ENV RUNNER_HEARTBEAT_FILE=/app/data/runner_heartbeat.json
+ENV RUNNER_HEARTBEAT_MAX_AGE_SECONDS=180
+
+CMD ["python", "scripts/run_simple_paper.py", "--headless"]

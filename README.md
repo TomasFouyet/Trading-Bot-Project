@@ -1,6 +1,54 @@
-# Trading Bot — BingX Full-Stack MVP
+# Trading Bot — BingX Runner + Research Stack
 
-Production-grade trading bot for BingX supporting **backtest**, **paper trading**, and **live trading** modes.
+El runtime operativo recomendado para paper/live es `scripts/run_simple_paper.py`.
+El stack FastAPI/Celery sigue en el repo como infraestructura paralela de investigación, pero no es el deploy recomendado para correr el bot 24/7.
+
+## Runtime recomendado 24/7
+
+### 1. Configurar credenciales
+
+```bash
+cp .env.example .env
+# Completa BINGX_API_KEY, BINGX_API_SECRET y Telegram si lo usas
+```
+
+### 2. Verificar conexión
+
+```bash
+python scripts/run_simple_paper.py --check
+```
+
+### 3. Ejecutar paper local
+
+```bash
+python scripts/run_simple_paper.py --symbol BTC --timeframe 15m --balance 100 --headless
+```
+
+### 4. Deploy recomendado con Docker Compose
+
+```bash
+docker compose -f docker-compose.runner.yml up -d --build
+docker compose -f docker-compose.runner.yml ps
+```
+
+El servicio `runner`:
+- ejecuta el runner real (`scripts/run_simple_paper.py`)
+- persiste `data/bot_state.json` y `data/runner_heartbeat.json`
+- se reinicia con `restart: unless-stopped`
+- expone health mediante el heartbeat local, sin abrir puertos HTTP inseguros
+
+### 5. Health / observabilidad mínima
+
+- Estado persistido: `data/bot_state.json`
+- Heartbeat: `data/runner_heartbeat.json`
+- Healthcheck local: `python scripts/check_runner_health.py`
+
+`runner_heartbeat.json` refleja:
+- `status`: `flat`, `in_position`, `recovering`, `safe_mode`, `error`, `stopped`
+- `last_bar_ts`
+- `last_progress_at`
+- `safe_mode_reason`
+- `last_error`
 
 ## Architecture
 
@@ -39,21 +87,18 @@ Redis    (Celery broker + results)
 Prometheus + Grafana (metrics + dashboards)
 ```
 
+## Legacy full-stack compose
+
+`docker-compose.yml` sigue existiendo para el stack API/Celery/monitoring, pero hoy no representa el runtime operativo principal del bot.
+
 ## Quick Start
 
 ### 1. Prerequisites
 
 - Docker + Docker Compose
-- BingX API Key & Secret (for live data; paper mode works with keys for ticker prices)
+- BingX API Key & Secret
 
-### 2. Configure
-
-```bash
-cp .env.example .env
-# Edit .env and set your BingX credentials
-```
-
-### 3. Start all services
+### 2. Start legacy services
 
 ```bash
 docker compose up -d
@@ -127,22 +172,8 @@ python scripts/run_backtest.py \
 
 ### C. Start paper trading
 
-**Via API:**
 ```bash
-curl -X POST http://localhost:8000/bot/start \
-  -H "Content-Type: application/json" \
-  -d '{"symbol": "BTC-USDT", "timeframe": "5m", "mode": "paper"}'
-
-# Check status
-curl http://localhost:8000/bot/status
-
-# Stop
-curl -X POST http://localhost:8000/bot/stop
-```
-
-**Via script (local):**
-```bash
-python scripts/run_paper.py --symbol BTC-USDT --timeframe 5m --balance 10000
+python scripts/run_simple_paper.py --symbol BTC --timeframe 15m --balance 100 --headless
 ```
 
 ### D. View trades and metrics

@@ -1,0 +1,80 @@
+{
+  "verdict": "BOT_HAS_DRIFTED",
+  "documented": {
+    "total_trades": 353,
+    "winrate": 36.8,
+    "expr": 0.335,
+    "annual_return_pct": 79.4,
+    "sharpe_ratio": 3.2
+  },
+  "validator_metrics": {
+    "total_trades": 353,
+    "winrate": 36.827195467422094,
+    "expr": 0.33481725233846005,
+    "sharpe_ratio": 3.182810745364044,
+    "max_drawdown_pct": 11.884870291775883,
+    "annual_return_pct": 79.40078254338363,
+    "long_trades": 173,
+    "short_trades": 180
+  },
+  "bot_metrics": {
+    "total_trades": 247,
+    "winrate": 38.8663967611336,
+    "expr": 0.38262741464957695,
+    "sharpe_ratio": 3.555875830477676,
+    "max_drawdown_pct": 12.852115047575063,
+    "annual_return_pct": 61.35568791943295,
+    "long_trades": 117,
+    "short_trades": 130
+  },
+  "git_log": null,
+  "diff_summary": {
+    "validator_only_lines": 0,
+    "bot_only_lines": 3,
+    "modified_lines": 733,
+    "files": [
+      "validation/fast_backtest.py",
+      "validation/structural_stop.py",
+      "app/strategy/trend_following_v2_simple.py",
+      "scripts/run_simple_paper.py"
+    ],
+    "section_analysis": [
+      {
+        "section": "Condiciones de entrada",
+        "status": "MAYORMENTE IDENTICAS",
+        "detail": "EMA/ADX/MACD/pullback/candle body/cooldown usan la misma formula base en fast_backtest y TrendFollowingV2Simple."
+      },
+      {
+        "section": "Filtro HTF",
+        "status": "DIFERENTE",
+        "detail": "El validador aplica HTF dentro de fast_backtest con sesgo binario close>EMA50/close<EMA50. El bot lo aplica afuera, en run_simple_paper.py, con banda neutral de \u00b10.2%."
+      },
+      {
+        "section": "C\u00e1lculo de SL",
+        "status": "IDENTICO",
+        "detail": "Ambos caminos llaman a validation.structural_stop.compute_structural_sl con pivots 3/3, buffer 0.25 ATR y min_risk 0.8 ATR."
+      },
+      {
+        "section": "C\u00e1lculo de TP",
+        "status": "DIFERENTE EN PARAMETRO",
+        "detail": "La f\u00f3rmula es la misma (risk * rr_ratio), pero el baseline validado usa rr=2.7 y el runner actual pasa rr=2.5."
+      },
+      {
+        "section": "Estado y ejecuci\u00f3n",
+        "status": "DIFERENTE",
+        "detail": "fast_backtest solo abre trade si el HTF ya aprob\u00f3 la entrada. El bot actual deja que la estrategia mutile su estado interno antes del filtro HTF del runner, lo que puede crear ghost trades."
+      },
+      {
+        "section": "Position sizing",
+        "status": "DIFERENTE",
+        "detail": "El validador mide retornos por trade sin sizing de equity. El runner usa sizing por riesgo y leverage m\u00e1ximo."
+      }
+    ],
+    "impact_analysis": [
+      "El runner actual usa rr_ratio=2.5 en lugar de 2.7, lo que reduce payoff por ganador y normalmente baja ExpR y annual return.",
+      "El filtro HTF del runner tiene una zona neutral \u00b10.2% alrededor de EMA50 4H, mientras el validador usa comparaci\u00f3n estricta. Eso cambia qu\u00e9 se\u00f1ales pasan.",
+      "Como el filtro HTF vive fuera de la estrategia, el bot puede quedar con un trade interno abierto aunque la entrada haya sido rechazada por el runner. Eso filtra se\u00f1ales posteriores de forma no validada.",
+      "fast_backtest soporta modos ATR/HYBRID/trailing/reg\u00edmenes porque tambi\u00e9n se usa como harness experimental; TrendFollowingV2Simple no expone todo eso en su interfaz deployable."
+    ]
+  }
+}

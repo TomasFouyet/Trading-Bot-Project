@@ -33,9 +33,16 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
+import numpy as np
 
 from app.strategy.base import BaseStrategy
 from app.strategy.signals import Signal, SignalAction
+from validation.structural_stop import (
+    build_last_pivot_arrays,
+    compute_pivot_highs,
+    compute_pivot_lows,
+    compute_structural_sl,
+)
 
 
 @dataclass
@@ -94,6 +101,11 @@ class TrendFollowingV2Simple(BaseStrategy):
         # ── Simple exit parameters (NEW) ──────────────────────────────
         self._rr_ratio       = float(self.params.get("rr_ratio",               2.0))
         self._atr_sl_mult    = float(self.params.get("atr_sl_mult",            1.5))
+        self._structural_stop_enabled = bool(self.params.get("structural_stop_enabled", True))
+        self._structural_buffer_atr = float(self.params.get("structural_buffer_atr", 0.25))
+        self._structural_min_risk_atr = float(self.params.get("structural_min_risk_atr", 0.8))
+        self._structural_pivot_left = int(self.params.get("structural_pivot_left", 3))
+        self._structural_pivot_right = int(self.params.get("structural_pivot_right", 3))
 
         # ── Internal state ────────────────────────────────────────────
         self._trade = _Trade()
@@ -118,6 +130,60 @@ class TrendFollowingV2Simple(BaseStrategy):
     @property
     def engine_manages_sl_tp(self) -> bool:
         return False
+
+    def force_close(self) -> None:
+        """Reset runtime trade state."""
+        self._trade.reset()
+
+    def export_runtime_state(self) -> dict[str, Any]:
+        """Persist minimal runtime state needed for crash recovery."""
+        return {
+            "bar_index": self._bar_index,
+            "last_long_bar": self._last_long_bar,
+            "last_short_bar": self._last_short_bar,
+            "prev_long_signal": self._prev_long_signal,
+            "prev_short_signal": self._prev_short_signal,
+            "trade": {
+                "state": self._trade.state,
+                "entry": self._trade.entry,
+                "sl": self._trade.sl,
+                "tp": self._trade.tp,
+                "start_bar": self._trade.start_bar,
+            },
+        }
+
+    def restore_runtime_state(self, state: dict[str, Any] | None) -> None:
+        """Restore strategy runtime state after crash recovery."""
+        if not state:
+            return
+        self._bar_index = int(state.get("bar_index", self._bar_index))
+        self._last_long_bar = int(state.get("last_long_bar", self._last_long_bar))
+        self._last_short_bar = int(state.get("last_short_bar", self._last_short_bar))
+        self._prev_long_signal = bool(state.get("prev_long_signal", self._prev_long_signal))
+        self._prev_short_signal = bool(state.get("prev_short_signal", self._prev_short_signal))
+
+        trade = state.get("trade") or {}
+        self._trade.state = int(trade.get("state", 0))
+        self._trade.entry = float(trade.get("entry", 0.0))
+        self._trade.sl = float(trade.get("sl", 0.0))
+        self._trade.tp = float(trade.get("tp", 0.0))
+        self._trade.start_bar = int(trade.get("start_bar", 0))
+
+    def restore_open_trade(
+        self,
+        *,
+        side: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        start_bar: int | None = None,
+    ) -> None:
+        """Rebuild runtime trade state from a persisted open trade."""
+        self._trade.state = 1 if side == "LONG" else -1
+        self._trade.entry = float(entry_price)
+        self._trade.sl = float(stop_loss)
+        self._trade.tp = float(take_profit)
+        self._trade.start_bar = int(start_bar if start_bar is not None else self._bar_index)
 
     # ══════════════════════════════════════════════════════════════════
     # INDICATORS — copied verbatim from V2
@@ -300,16 +366,12 @@ class TrendFollowingV2Simple(BaseStrategy):
 
         # ── STEP 3: Open new trade if flat (NO reversal swap) ────────
         if self._trade.is_flat() and (long_trigger or short_trigger):
-            if long_trigger:
-                sl_dist = atr * self._atr_sl_mult
-                sl = close - sl_dist
-                tp = close + sl_dist * self._rr_ratio
-                signals.append(self._open_trade(ts, close, sl, tp, "LONG", ind))
-            elif short_trigger:
-                sl_dist = atr * self._atr_sl_mult
-                sl = close + sl_dist
-                tp = close - sl_dist * self._rr_ratio
-                signals.append(self._open_trade(ts, close, sl, tp, "SHORT", ind))
+            direction = "LONG" if long_trigger else "SHORT"
+            try:
+                sl, tp, sl_mode = self._compute_entry_levels(df, close, atr, direction)
+            except ValueError:
+                return [_hold(self.symbol, ts, self.strategy_id, "invalid_entry_levels", meta=ind)]
+            signals.append(self._open_trade(ts, close, sl, tp, direction, ind, sl_mode))
 
         if not signals:
             return [_hold(self.symbol, ts, self.strategy_id, "no_setup", meta=ind)]
@@ -367,8 +429,49 @@ class TrendFollowingV2Simple(BaseStrategy):
     # OPEN TRADE — fixed size, no tiers
     # ══════════════════════════════════════════════════════════════════
 
+    def _compute_entry_levels(
+        self,
+        df: pd.DataFrame,
+        close: float,
+        atr: float,
+        direction: str,
+    ) -> tuple[float, float, str]:
+        """Return official (stop_loss, take_profit, sl_mode) for a new trade."""
+        if atr <= 0:
+            raise ValueError("ATR must be positive to compute entry levels")
+
+        stop_mode = "STRUCTURAL" if self._structural_stop_enabled else "ATR"
+        lows = df["low"].astype(float).to_numpy(dtype=float)
+        highs = df["high"].astype(float).to_numpy(dtype=float)
+        pivot_lows = compute_pivot_lows(
+            lows, left=self._structural_pivot_left, right=self._structural_pivot_right
+        )
+        pivot_highs = compute_pivot_highs(
+            highs, left=self._structural_pivot_left, right=self._structural_pivot_right
+        )
+        last_pivot_low, last_pivot_high = build_last_pivot_arrays(
+            pivot_lows, pivot_highs, right=self._structural_pivot_right
+        )
+        stop_loss, sl_mode = compute_structural_sl(
+            entry_price=close,
+            direction=direction,
+            bar_idx=len(df) - 1,
+            last_pivot_low=last_pivot_low,
+            last_pivot_high=last_pivot_high,
+            atr=atr,
+            stop_mode=stop_mode,
+            atr_sl_mult=self._atr_sl_mult,
+            buffer_atr=self._structural_buffer_atr,
+            min_risk_atr=self._structural_min_risk_atr,
+        )
+        risk = abs(close - stop_loss)
+        if risk <= 0:
+            raise ValueError("Structural stop produced zero risk distance")
+        take_profit = close + risk * self._rr_ratio if direction == "LONG" else close - risk * self._rr_ratio
+        return float(stop_loss), float(take_profit), sl_mode
+
     def _open_trade(self, ts, close: float, sl: float, tp: float,
-                    direction: str, ind: dict) -> Signal:
+                    direction: str, ind: dict, sl_mode: str) -> Signal:
         self._trade.state = 1 if direction == "LONG" else -1
         self._trade.entry = close
         self._trade.sl = sl
@@ -395,6 +498,7 @@ class TrendFollowingV2Simple(BaseStrategy):
                 "rr_ratio": self._rr_ratio,
                 "atr_sl_mult": self._atr_sl_mult,
                 "risk": round(risk, 8),
+                "sl_mode": sl_mode,
             },
         )
 

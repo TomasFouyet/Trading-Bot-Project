@@ -91,11 +91,12 @@ def test_reset_kill_switch(risk_manager):
 def test_compute_order_qty(risk_manager):
     signal = make_signal(SignalAction.BUY)
     qty = risk_manager.compute_order_qty(signal, Decimal("10000"), Decimal("40000"))
-    # With 10% max position, equity=10000, price=40000:
-    # max_notional = 10000 * 10/100 = 1000
-    # qty = 1000 / 40000 = 0.025
+    # With 10% max margin, equity=10000, price=40000, and default leverage=3:
+    # max_margin = 10000 * 10/100 = 1000
+    # max_notional = 1000 * 3 = 3000
+    # qty cap = 3000 / 40000 = 0.075
     assert qty > 0
-    assert qty <= Decimal("0.025") + Decimal("0.001")
+    assert qty <= Decimal("0.075") + Decimal("0.001")
 
 
 def test_daily_drawdown_kill_switch():
