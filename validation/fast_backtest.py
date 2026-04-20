@@ -191,6 +191,7 @@ def fast_backtest(
     sl_dist = 0.0   # absolute SL distance for R-unit calculations
     entry_bar = 0
     last_sl_mode = "atr"
+    last_conf = 0.0
 
     # Trailing stop state
     trail_active = False
@@ -277,7 +278,7 @@ def fast_backtest(
                     exit_type="tp",
                     bars_held=i - entry_bar,
                     entry_bar_idx=entry_bar,
-                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
+                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
                 ))
                 in_trade = False
                 trail_active = False
@@ -292,7 +293,7 @@ def fast_backtest(
                     exit_type="trail",
                     bars_held=i - entry_bar,
                     entry_bar_idx=entry_bar,
-                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
+                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
                 ))
                 in_trade = False
                 trail_active = False
@@ -307,7 +308,7 @@ def fast_backtest(
                     exit_type="sl",
                     bars_held=i - entry_bar,
                     entry_bar_idx=entry_bar,
-                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
+                    sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
                 ))
                 in_trade = False
                 trail_active = False
@@ -381,6 +382,7 @@ def fast_backtest(
 
             if long_trigger:
                 entry_price = c
+                last_conf = conf_l
                 if stop_mode == "ATR" or last_pivot_low_arr is None:
                     sl_price = c - a * atr_sl_mult
                     last_sl_mode = "atr"
@@ -403,6 +405,7 @@ def fast_backtest(
                 peak_favorable = c
             elif short_trigger:
                 entry_price = c
+                last_conf = conf_s
                 if stop_mode == "ATR" or last_pivot_high_arr is None:
                     sl_price = c + a * atr_sl_mult
                     last_sl_mode = "atr"
@@ -435,7 +438,7 @@ def fast_backtest(
             exit_type="end_of_data",
             bars_held=n - 1 - entry_bar,
             entry_bar_idx=entry_bar,
-            sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode,
+            sl=sl_price, tp1=tp_price, sl_mode=last_sl_mode, confidence=last_conf,
         ))
 
     return _build_metrics(trades, df)

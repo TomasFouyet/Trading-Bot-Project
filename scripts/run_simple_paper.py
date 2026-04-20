@@ -37,6 +37,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import numpy as np
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VALIDATED PARAMS — do not change without re-running full WFA + PSA
@@ -53,9 +55,17 @@ VALIDATED_PARAMS = {
     "min_confidence":        0.0,   # No confidence filter — all signals
     "sig_cooldown":          5,
     "slope_bars":            5,
-    # Exit (validated)
-    "rr_ratio":              1.5,
+    # Exit (validated — rr=2.5, structural stop)
+    "rr_ratio":              2.5,
     "atr_sl_mult":           2.0,
+}
+
+STRUCTURAL_STOP_CFG = {
+    "enabled":        True,
+    "buffer_atr":     0.25,
+    "min_risk_atr":   0.8,
+    "pivot_left":     3,
+    "pivot_right":    3,
 }
 
 RISK_CONFIG = {
@@ -79,7 +89,8 @@ TRADES_HEADER = [
     "timestamp", "symbol", "side", "entry_price", "exit_price", "exit_type",
     "sl", "tp", "pnl_pct", "pnl_usd", "equity_after", "leverage_used",
     "sl_dist_pct", "adx_at_entry", "atr_at_entry", "htf_bias_at_entry",
-    "duration_bars", "entry_fee_type", "exit_fee_type",
+    "duration_bars", "entry_fee_type", "exit_fee_type", "sl_mode",
+    "confidence",
 ]
 # BingX Futures fees: maker (limit) 0.020%, taker (market) 0.050%
 MAKER_FEE = Decimal("0.00020")
@@ -459,6 +470,107 @@ async def _cmd_equity(notifier, state):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Structural Stop Override (applies validated pivot-based SL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_structural_sl_from_bars(bars_deque, entry_price: float,
+                                      direction: str, atr_val: float) -> tuple[float, str]:
+    """Compute structural SL from the bar buffer. Returns (sl_price, mode_label)."""
+    from validation.structural_stop import (
+        compute_pivot_lows, compute_pivot_highs,
+        build_last_pivot_arrays, compute_structural_sl,
+    )
+    cfg = STRUCTURAL_STOP_CFG
+    if not cfg["enabled"]:
+        sl_dist = atr_val * VALIDATED_PARAMS["atr_sl_mult"]
+        if direction == "LONG":
+            return entry_price - sl_dist, "atr"
+        else:
+            return entry_price + sl_dist, "atr"
+
+    lows = np.array([float(b.low) for b in bars_deque])
+    highs = np.array([float(b.high) for b in bars_deque])
+
+    pl = compute_pivot_lows(lows, cfg["pivot_left"], cfg["pivot_right"])
+    ph = compute_pivot_highs(highs, cfg["pivot_left"], cfg["pivot_right"])
+    last_pl, last_ph = build_last_pivot_arrays(pl, ph, right=cfg["pivot_right"])
+
+    bar_idx = len(bars_deque) - 1
+    return compute_structural_sl(
+        entry_price=entry_price,
+        direction=direction,
+        bar_idx=bar_idx,
+        last_pivot_low=last_pl,
+        last_pivot_high=last_ph,
+        atr=atr_val,
+        stop_mode="STRUCTURAL",
+        atr_sl_mult=VALIDATED_PARAMS["atr_sl_mult"],
+        buffer_atr=cfg["buffer_atr"],
+        min_risk_atr=cfg["min_risk_atr"],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# State Persistence (crash recovery)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import json
+
+STATE_FILE = Path("data/bot_state.json")
+
+
+def _save_state(state: dict, open_trade: dict | None, equity: float,
+                peak_equity: float, wins: int, losses: int):
+    """Persist bot state to disk for crash recovery."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "position": None,
+        "equity": equity,
+        "peak_equity": peak_equity,
+        "wins": wins,
+        "losses": losses,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+    if open_trade:
+        data["position"] = {
+            "side": open_trade["side"],
+            "entry_price": float(open_trade["entry_price"]),
+            "sl": float(open_trade["sl"]),
+            "tp": float(open_trade["tp"]),
+            "qty": float(open_trade["qty"]),
+            "entry_time": open_trade.get("entry_time", ""),
+            "trade_id": open_trade.get("trade_id", ""),
+            "adx_at_entry": open_trade.get("adx_at_entry", 0),
+            "sl_mode": open_trade.get("sl_mode", "unknown"),
+            "leverage": open_trade.get("leverage", 0),
+            "sl_dist_pct": open_trade.get("sl_dist_pct", 0),
+            "atr_at_entry": open_trade.get("atr_at_entry", 0),
+            "htf_bias_at_entry": open_trade.get("htf_bias_at_entry", 0),
+            "fee_in": float(open_trade.get("fee_in", 0)),
+            "entry_fee_type": open_trade.get("entry_fee_type", "taker"),
+        }
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _load_state() -> dict | None:
+    """Load saved state. Returns None if no state file."""
+    if not STATE_FILE.exists():
+        return None
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def _clear_state():
+    """Remove state file after clean close."""
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main trading loop
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -501,6 +613,50 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
     equity = float(args.balance)
     open_trade: dict | None = None
     bar_count_in_trade = 0
+
+    # ── State recovery (crash protection) ────────────────────
+    saved = _load_state()
+    if saved:
+        equity = saved.get("equity", equity)
+        state["equity"] = equity
+        state["wins"] = saved.get("wins", 0)
+        state["losses"] = saved.get("losses", 0)
+        cb.peak_equity = saved.get("peak_equity", equity)
+        cb.current_equity = equity
+        if saved.get("position"):
+            pos = saved["position"]
+            open_trade = {
+                "trade_id": pos.get("trade_id", "recovered"),
+                "symbol": symbol,
+                "side": pos["side"],
+                "entry_price": Decimal(str(pos["entry_price"])),
+                "qty": Decimal(str(pos["qty"])),
+                "fee_in": Decimal(str(pos.get("fee_in", 0))),
+                "entry_fee_type": pos.get("entry_fee_type", "taker"),
+                "sl": Decimal(str(pos["sl"])),
+                "tp": Decimal(str(pos["tp"])),
+                "leverage": pos.get("leverage", 1.0),
+                "sl_dist_pct": pos.get("sl_dist_pct", 0),
+                "sl_mode": pos.get("sl_mode", "unknown"),
+                "adx_at_entry": pos.get("adx_at_entry", 0),
+                "atr_at_entry": pos.get("atr_at_entry", 0),
+                "htf_bias_at_entry": pos.get("htf_bias_at_entry", 0),
+                "entry_time": pos.get("entry_time", ""),
+                "sl_order_id": None,
+            }
+            state["open_trade"] = open_trade
+            _log(f"  [{s}] RECOVERED position: {pos['side']} @ ${pos['entry_price']:,.2f}"
+                 f" SL=${pos['sl']:,.2f} TP=${pos['tp']:,.2f}")
+            await _tg_send(notifier,
+                f"\u26a0\ufe0f <b>POSITION RECOVERED</b>\n\n"
+                f"Side: {pos['side']}\n"
+                f"Entry: ${pos['entry_price']:,.2f}\n"
+                f"SL: ${pos['sl']:,.2f}\n"
+                f"TP: ${pos['tp']:,.2f}\n"
+                f"Equity: ${equity:,.2f}")
+        else:
+            _log(f"  [{s}] State recovered (no open position)")
+            _log(f"  [{s}] Equity=${equity:,.2f} W={state['wins']} L={state['losses']}")
 
     tf_secs = TIMEFRAME_SECONDS.get(args.timeframe, 900)
     feed = LiveFeed(client=client, store=store, symbol=symbol,
@@ -702,6 +858,8 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                             "duration_bars": bar_count_in_trade,
                             "entry_fee_type": open_trade.get("entry_fee_type", "taker"),
                             "exit_fee_type": "maker" if exit_type == "tp" else "taker",
+                            "sl_mode": open_trade.get("sl_mode", ""),
+                            "confidence": open_trade.get("confidence", ""),
                         })
 
                         # Telegram — rich close notification
@@ -729,6 +887,10 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                         bar_count_in_trade = 0
                         state["open_trade"] = None
                         state["upnl_pct"] = 0.0
+
+                        # Persist state (position closed)
+                        _save_state(state, None, equity,
+                                    cb.peak_equity, state["wins"], state["losses"])
 
                 # ── BUY / SELL ───────────────────────────────────
                 elif sig.action in (SignalAction.BUY, SignalAction.SELL):
@@ -778,14 +940,22 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                         _log(f"  [{s}] Signal {direction} rejected \u2014 HTF bias={htf.label}")
                         continue
 
-                    # Position sizing
-                    sl_price = float(sig.meta.get("sl", 0))
-                    tp_price = float(sig.meta.get("tp1", 0))
+                    # Position sizing — structural SL override
                     atr_val = float(sig.meta.get("atr", 0))
                     adx_val = float(sig.meta.get("adx", 0))
 
+                    if atr_val <= 0:
+                        _log(f"  [{s}] No ATR in signal — skipping")
+                        continue
+
+                    sl_price, sl_mode = _compute_structural_sl_from_bars(
+                        bw, close, direction, atr_val)
+                    sl_dist = abs(close - sl_price)
+                    tp_price = close + sl_dist * VALIDATED_PARAMS["rr_ratio"] if direction == "LONG" \
+                        else close - sl_dist * VALIDATED_PARAMS["rr_ratio"]
+
                     if sl_price <= 0:
-                        _log(f"  [{s}] No SL in signal \u2014 skipping")
+                        _log(f"  [{s}] Invalid SL={sl_price} — skipping")
                         continue
 
                     qty, position_usd, leverage = compute_position(
@@ -835,6 +1005,7 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                             "tp": Decimal(str(tp_price)),
                             "leverage": leverage,
                             "sl_dist_pct": sl_dist_pct,
+                            "sl_mode": sl_mode,
                             "adx_at_entry": round(adx_val, 1),
                             "atr_at_entry": round(atr_val, 2),
                             "htf_bias_at_entry": htf.bias,
@@ -843,6 +1014,10 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                         }
                         bar_count_in_trade = 0
                         state["open_trade"] = open_trade
+
+                        # Persist state (crash recovery)
+                        _save_state(state, open_trade, equity,
+                                    cb.peak_equity, state["wins"], state["losses"])
 
                         # Place exchange SL (crash protection) in live mode
                         if is_live and sl_price > 0:
@@ -871,7 +1046,7 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                             f"\n     SL=${sl_price:,.2f} (-{sl_pct:.2f}%)"
                             f"  TP=${tp_price:,.2f} (+{tp_dist_pct:.2f}%)"
                             f"\n     Risk={cb.risk_pct:.1f}% (${equity*cb.risk_pct/100:,.2f})"
-                            f"  Lev={leverage:.1f}x  ATR=${atr_val:,.2f}  ADX={adx_val:.1f}\n"
+                            f"  Lev={leverage:.1f}x  ATR=${atr_val:,.2f}  ADX={adx_val:.1f}  SL_mode={sl_mode}\n"
                         )
 
                         # Telegram — rich open notification
@@ -912,8 +1087,66 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                     gross_pnl = (entry_px - fill.price) * fill.qty
                 net_pnl = gross_pnl - open_trade["fee_in"] - fill.fee
                 _log(f"  [{s}] Closed @ ${bc:,.2f}  pnl=${float(net_pnl):+.2f}")
+                equity += float(net_pnl)
+                state["equity"] = equity
             except Exception as e:
                 _log_error(f"  [{s}] Shutdown close failed: {e}")
+
+        # Persist final state on clean shutdown
+        _save_state(state, None, equity, cb.peak_equity, state["wins"], state["losses"])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Weekly Report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _weekly_report_text(state) -> str:
+    """Generate weekly performance report text."""
+    import math
+    w, l = state.get("wins", 0), state.get("losses", 0)
+    t = w + l
+    eq = state.get("equity", 0)
+    start = state.get("start_balance", eq)
+    cb: CircuitBreaker = state["circuit_breaker"]
+
+    wr_actual = w / t if t > 0 else 0
+    wr_pct = wr_actual * 100
+
+    # Backtest reference values
+    wr_bt = 0.368  # 36.8% from structural rr=2.5 validation
+    expr_bt = 0.335  # +0.335R
+
+    # CI for WR
+    if t > 0:
+        margin = 1.96 * math.sqrt(wr_bt * (1 - wr_bt) / t)
+        ci_lo = max(0, (wr_bt - margin)) * 100
+        ci_hi = min(1, (wr_bt + margin)) * 100
+        in_ci = ci_lo <= wr_pct <= ci_hi
+    else:
+        ci_lo = ci_hi = 0
+        in_ci = True
+
+    # Actual ExpR from CSV
+    trades = _read_last_trades(100)
+    pnls = [float(r.get("pnl_pct", 0)) for r in trades if r.get("pnl_pct")]
+    losses_pnl = [p for p in pnls if p < 0]
+    avg_loss = abs(sum(losses_pnl) / len(losses_pnl)) if losses_pnl else 1
+    expr_actual = (sum(pnls) / len(pnls)) / avg_loss if pnls and avg_loss > 0 else 0
+
+    net = eq - start
+    net_pct = net / start * 100 if start > 0 else 0
+
+    return (
+        f"\U0001f4cb <b>WEEKLY REPORT</b>\n\n"
+        f"\U0001f4b0 Equity: <code>${eq:,.2f}</code> ({'+' if net >= 0 else ''}{net_pct:.1f}%)\n"
+        f"\U0001f4c9 DD from peak: {cb.drawdown_pct:.1f}%\n"
+        f"\U0001f4ca Trades: {t} (W={w} L={l})\n"
+        f"\n<b>Performance vs Backtest</b>\n"
+        f"WR actual: {wr_pct:.1f}% vs backtest {wr_bt*100:.1f}%\n"
+        f"ExpR actual: {expr_actual:+.3f}R vs backtest {expr_bt:+.3f}R\n"
+        f"95% CI for WR ({t} trades): {ci_lo:.1f}% - {ci_hi:.1f}%\n"
+        f"Within CI: {'YES' if in_ci else 'NO'}\n"
+        f"\nExpected WR: {wr_bt*100:.1f}% +/- {(ci_hi-ci_lo)/2:.1f}pp with {t} trades"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -921,6 +1154,7 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _status_loop(state, symbol, shutdown_event):
+    last_weekly = datetime.now(timezone.utc)
     await asyncio.sleep(60)  # Initial delay
     while not shutdown_event.is_set():
         try:
@@ -954,6 +1188,15 @@ async def _status_loop(state, symbol, shutdown_event):
                 f"\U0001f9ed HTF Bias: {htf_str}\n"
                 f"\u26a1 Risk/trade: {cb.risk_pct:.1f}%\n"
                 f"\u23f0 {now}")
+
+            # Weekly report (every 7 days or Monday)
+            now_dt = datetime.now(timezone.utc)
+            days_since = (now_dt - last_weekly).total_seconds() / 86400
+            if days_since >= 7 or (now_dt.weekday() == 0 and days_since >= 1):
+                report = _weekly_report_text(state)
+                await _tg_send(notifier, report)
+                _log(f"  [Weekly report sent]")
+                last_weekly = now_dt
         except Exception:
             pass
         try:
@@ -1062,7 +1305,8 @@ async def main(args):
     _log(f"  Risk/trade: {RISK_CONFIG['risk_pct_per_trade']}%")
     _log(f"  Max lev:    {RISK_CONFIG['max_leverage']}x")
     _log(f"  RR ratio:   {VALIDATED_PARAMS['rr_ratio']}")
-    _log(f"  ATR SL:     {VALIDATED_PARAMS['atr_sl_mult']}x")
+    _log(f"  Stop:       STRUCTURAL (pivot L/R={STRUCTURAL_STOP_CFG['pivot_left']}/{STRUCTURAL_STOP_CFG['pivot_right']}, buf={STRUCTURAL_STOP_CFG['buffer_atr']}ATR, min={STRUCTURAL_STOP_CFG['min_risk_atr']}ATR)")
+    _log(f"  ATR fallbk: {VALIDATED_PARAMS['atr_sl_mult']}x")
     _log(f"  HTF filter: {'ON (4H EMA50)' if HTF_CONFIG['enabled'] else 'OFF'}")
     _log(f"  CB warn:    {RISK_CONFIG['max_daily_dd_pct']}% DD")
     _log(f"  CB stop:    {RISK_CONFIG['circuit_breaker_pct']}% DD")
@@ -1075,7 +1319,7 @@ async def main(args):
         f"\U0001f4cb Estrategia: TrendFollowingV2Simple\n"
         f"\U0001f4b0 Balance: <code>${args.balance:,.2f}</code>\n"
         f"\U0001f4ca Symbol: {symbol} | {args.timeframe}\n"
-        f"\U0001f3af RR: {VALIDATED_PARAMS['rr_ratio']} | SL: {VALIDATED_PARAMS['atr_sl_mult']}\u00d7ATR\n"
+        f"\U0001f3af RR: {VALIDATED_PARAMS['rr_ratio']} | Stop: STRUCTURAL (fallback {VALIDATED_PARAMS['atr_sl_mult']}\u00d7ATR)\n"
         f"\u26a1 Risk/trade: {RISK_CONFIG['risk_pct_per_trade']}%\n"
         f"\U0001f9ed HTF Filter: {'ON (4H EMA50)' if HTF_CONFIG['enabled'] else 'OFF'}\n"
         f"\U0001f6e1 Circuit Breaker: warn={RISK_CONFIG['max_daily_dd_pct']:.0f}% / stop={RISK_CONFIG['circuit_breaker_pct']:.0f}%\n"
