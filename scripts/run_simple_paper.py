@@ -1349,7 +1349,9 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
             # ── Run strategy ─────────────────────────────────────
             df = BaseStrategy.bars_to_df(list(bw))
             try:
-                signals = strategy.on_bar_all(df)
+                signals = strategy.on_bar_all(
+                    df, htf_bias=htf.bias if HTF_CONFIG["enabled"] else None
+                )
             except Exception as e:
                 _log_error(f"  [{s}] Strategy error: {e}")
                 continue
@@ -1632,11 +1634,6 @@ async def run_symbol(symbol, client, adapter, args, shutdown_event, state, is_li
                             _log(f"  [{s}] Closed {open_trade['side']} for reversal: ${float(net_pnl):+.2f}")
                             open_trade = None
                             bar_count_in_trade = 0
-
-                    # HTF filter: reject signals against the 4H trend
-                    if HTF_CONFIG["enabled"] and not htf.is_aligned(direction):
-                        _log(f"  [{s}] Signal {direction} rejected \u2014 HTF bias={htf.label}")
-                        continue
 
                     # Position sizing — structural SL override
                     atr_val = float(sig.meta.get("atr", 0))

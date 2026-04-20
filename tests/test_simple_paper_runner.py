@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
+import pandas as pd
 
 from app.broker.bingx_client import BingXClient
 from app.broker.base import Position, TradeSide
 from app.core.exceptions import BrokerError
+from app.strategy.signals import SignalAction
 from app.strategy.trend_following_v2_simple import TrendFollowingV2Simple
 from scripts import run_simple_paper as runner
 
@@ -53,6 +55,47 @@ def test_strategy_runtime_state_restores_open_trade():
     restored.restore_runtime_state(snapshot)
 
     assert restored.export_runtime_state()["trade"] == snapshot["trade"]
+
+
+def test_strategy_htf_filter_blocks_trade_state_mutation(monkeypatch):
+    strategy = _validated_strategy()
+
+    rows = strategy.min_bars_required
+    base = pd.DataFrame(
+        {
+            "ts": pd.date_range("2024-01-01", periods=rows, freq="15min", tz="UTC"),
+            "open": [100.0] * rows,
+            "high": [101.0] * rows,
+            "low": [99.0] * rows,
+            "close": [100.0] * rows,
+            "volume": [10.0] * rows,
+        }
+    )
+
+    fake = base.copy()
+    fake["atr"] = 1.0
+    fake["adx"] = 30.0
+    fake["ema_fast"] = 99.5
+    fake["ema_slow"] = 99.0
+    fake["ema_slow_slope"] = 1.0
+    fake["ema_fast_slope"] = 1.0
+    fake["macd"] = 2.0
+    fake["macd_signal"] = 1.0
+    fake["macd_hist"] = 1.0
+    fake["vol_sma"] = 10.0
+    fake.loc[fake.index[-1], "open"] = 100.0
+    fake.loc[fake.index[-1], "close"] = 100.5
+
+    monkeypatch.setattr(strategy, "_compute_indicators", lambda df: fake.copy())
+    monkeypatch.setattr(strategy, "_compute_confidence", lambda row, df, direction: 1.0)
+
+    before = strategy.export_runtime_state()
+    signals = strategy.on_bar_all(base, htf_bias=-1)
+    after = strategy.export_runtime_state()
+
+    assert all(sig.action == SignalAction.HOLD for sig in signals)
+    assert after["last_long_bar"] == before["last_long_bar"]
+    assert after["trade"]["state"] == 0
 
 
 class _FlatAdapter:

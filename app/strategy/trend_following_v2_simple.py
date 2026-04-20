@@ -290,7 +290,7 @@ class TrendFollowingV2Simple(BaseStrategy):
     # MAIN: on_bar_all() — simplified state machine
     # ══════════════════════════════════════════════════════════════════
 
-    def on_bar_all(self, df: pd.DataFrame, htf_bias=None) -> list[Signal]:
+    def on_bar_all(self, df: pd.DataFrame, htf_bias: int | None = None) -> list[Signal]:
         self._bar_index += 1
         ts = df["ts"].iloc[-1]
         if hasattr(ts, "to_pydatetime"):
@@ -351,6 +351,14 @@ class TrendFollowingV2Simple(BaseStrategy):
         # ── Cooldown (IDENTICAL to V2) ────────────────────────────────
         long_trigger  = long_trigger_raw  and (self._bar_index - self._last_long_bar)  >= self._sig_cooldown
         short_trigger = short_trigger_raw and (self._bar_index - self._last_short_bar) >= self._sig_cooldown
+
+        # Apply HTF alignment before mutating cooldown state or opening trades.
+        if htf_bias is not None:
+            if long_trigger and htf_bias == -1:
+                long_trigger = False
+            if short_trigger and htf_bias == 1:
+                short_trigger = False
+
         if long_trigger:
             self._last_long_bar = self._bar_index
         if short_trigger:
@@ -378,7 +386,7 @@ class TrendFollowingV2Simple(BaseStrategy):
 
         return signals
 
-    def on_bar(self, df: pd.DataFrame, htf_bias=None) -> Signal:
+    def on_bar(self, df: pd.DataFrame, htf_bias: int | None = None) -> Signal:
         sigs = self.on_bar_all(df, htf_bias=htf_bias)
         return sigs[0] if sigs else _hold(
             self.symbol, df["ts"].iloc[-1], self.strategy_id, "no_signal")
