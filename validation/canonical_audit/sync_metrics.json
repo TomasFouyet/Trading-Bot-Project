@@ -1,0 +1,22 @@
+{
+  "validator": {
+    "total_trades": 353,
+    "winrate": 36.827195467422094,
+    "expr": 0.33481725233846005,
+    "sharpe": 3.182810745364044,
+    "max_drawdown_pct": 11.884870291775883,
+    "annual_return_pct": 79.40078254338363,
+    "long_trades": 173,
+    "short_trades": 180
+  },
+  "bot": {
+    "total_trades": 352,
+    "winrate": 36.93181818181818,
+    "expr": 0.33256688929215417,
+    "sharpe": 3.158486778579981,
+    "max_drawdown_pct": 11.88487029176345,
+    "annual_return_pct": 78.29956316306752,
+    "long_trades": 173,
+    "short_trades": 179
+  }
+}
