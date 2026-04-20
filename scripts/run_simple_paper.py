@@ -56,8 +56,8 @@ VALIDATED_PARAMS = {
     "min_confidence":        0.0,   # No confidence filter — all signals
     "sig_cooldown":          5,
     "slope_bars":            5,
-    # Exit (validated — rr=2.5, structural stop)
-    "rr_ratio":              2.5,
+    # Exit (validated — rr=2.7, structural stop)
+    "rr_ratio":              2.7,
     "atr_sl_mult":           2.0,
     "structural_stop_enabled": True,
     "structural_buffer_atr": 0.25,

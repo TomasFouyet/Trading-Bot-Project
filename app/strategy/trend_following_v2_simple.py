@@ -99,7 +99,7 @@ class TrendFollowingV2Simple(BaseStrategy):
         self._sig_cooldown   = int(self.params.get("sig_cooldown",              5))
 
         # ── Simple exit parameters (NEW) ──────────────────────────────
-        self._rr_ratio       = float(self.params.get("rr_ratio",               2.0))
+        self._rr_ratio       = float(self.params.get("rr_ratio",               2.7))
         self._atr_sl_mult    = float(self.params.get("atr_sl_mult",            1.5))
         self._structural_stop_enabled = bool(self.params.get("structural_stop_enabled", True))
         self._structural_buffer_atr = float(self.params.get("structural_buffer_atr", 0.25))
