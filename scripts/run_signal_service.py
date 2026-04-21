@@ -43,6 +43,8 @@ DEFAULT_PARAMS = {
     "structural_pivot_right": 3,
 }
 
+IDLE_POLL_SECONDS = 5
+
 CSV_COLUMNS = [
     "timestamp_utc",
     "signal_type",
@@ -625,12 +627,8 @@ def _load_config() -> ServiceConfig:
     )
 
 
-def _sleep_to_next_minute() -> None:
-    now = datetime.now(UTC)
-    sleep_s = 60 - now.second
-    if sleep_s <= 0:
-        sleep_s = 1
-    time.sleep(sleep_s)
+def _sleep_idle() -> None:
+    time.sleep(IDLE_POLL_SECONDS)
 
 
 def _should_poll(now: datetime) -> bool:
@@ -676,7 +674,7 @@ def main() -> int:
             now = datetime.now(UTC)
             if _should_send_heartbeat(now):
                 service.maybe_send_heartbeat(now)
-                time.sleep(31)
+                _sleep_idle()
                 continue
             if _should_poll(now):
                 summary = service.run_once()
@@ -687,9 +685,9 @@ def main() -> int:
                         summary.signals_emitted,
                         _bias_label(summary.latest_htf_bias),
                     )
-                time.sleep(31)
+                _sleep_idle()
             else:
-                _sleep_to_next_minute()
+                _sleep_idle()
     finally:
         service.stop()
     return 0
