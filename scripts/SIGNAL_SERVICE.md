@@ -43,6 +43,24 @@ Service started | BTC-USDT 15m | equity=100.00 USDT | HTF bias=BULL
   - o `Bar closed | signal=LONG|SHORT | ...`
 
 - Si hay señal, Telegram recibe un mensaje con entrada, SL, TP, contexto ADX/body/MACD, sesgo HTF y sizing sugerido.
+- Si un trade virtual toca TP o SL, Telegram también recibe el cierre correspondiente.
+
+## Notificaciones que vas a recibir
+- `ENTRY`: apertura LONG o SHORT con entrada, SL, TP y sizing sugerido.
+- `EXIT TP`: cierre en take profit con PnL, duración y cooldown.
+- `EXIT SL`: cierre en stop loss con PnL, duración y cooldown.
+- `START`: mensaje de arranque `🚀` con símbolo, intervalo, equity y bootstrap.
+- `STOP`: mensaje de detención `🛑` con velas procesadas, señales, cierres y uptime.
+- `DAILY SUMMARY`: resumen UTC del día anterior con señales, cierres, PnL y uptime.
+- `API ERROR`: alerta `⚠️` si BingX falla de forma persistente.
+
+## Discrepancias manuales
+El modo actual es **notificaciones puras**: no toca BingX, no abre ni cierra órdenes, solo observa y avisa.
+
+Si ves una discrepancia:
+- Telegram muestra cierre pero no ejecutaste manualmente: revisa `data/live_signals.csv` y `data/live_closures.csv`; por ahora la reconciliación es manual.
+- Ejecutaste manualmente pero no ves cierre en Telegram: compara el timestamp de tu ejecución con la vela 15m cerrada y revisa `logs/signal_service.log`.
+- Si necesitas corregir contexto para seguir operando, edita manualmente los CSVs. En una fase futura esto se hará con comandos Telegram.
 
 ## Cómo interpretar el log
 - `bingx_fetch_retry`: fallo temporal de red o 5xx; el cliente reintenta hasta 3 veces.
@@ -53,4 +71,5 @@ Service started | BTC-USDT 15m | equity=100.00 USDT | HTF bias=BULL
 ## Archivos generados
 - `logs/signal_service.log`: log rotado diariamente.
 - `data/live_signals.csv`: registro plano de señales enviadas.
+- `data/live_closures.csv`: registro plano de cierres observados.
 - `data/signal_service_state.json`: snapshot del estado al cerrar para recuperación ordenada.

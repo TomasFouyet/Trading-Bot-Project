@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 import httpx
 
@@ -267,6 +268,104 @@ class TelegramNotifier:
             f"\n⏰ {_now_str()}"
         )
         return await self.send(msg)
+
+
+@dataclass
+class SignalServiceTelegramNotifier:
+    token: str
+    chat_id: str
+    enabled: bool = True
+
+    def send_html(self, text: str) -> bool:
+        if not (self.enabled and self.token and self.chat_id):
+            return False
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+        try:
+            response = httpx.post(url, json=payload, timeout=10.0)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def send_entry_notification(self, signal: Any, context: dict[str, Any]) -> bool:
+        direction = context["signal_type"]
+        color = "🟢" if direction == "LONG" else "🔴"
+        message = (
+            f"{color} <b>{direction} {signal.symbol} 15m | {signal.ts.strftime('%Y-%m-%d %H:%M')} UTC</b>\n\n"
+            f"📍 Entrada:    <code>{context['entry']:.2f}</code>\n"
+            f"🛡️ SL:          <code>{context['sl']:.2f}</code>  (-{context['risk_pct']:.2f}%, risk 1.5%)\n"
+            f"🎯 TP:          <code>{context['tp']:.2f}</code>  (+{context['tp_pct']:.2f}%, R:R {context['rr_ratio']:.1f})\n\n"
+            f"━━━ Contexto ━━━\n"
+            f"⚡ ADX:          {context['adx']:.1f}  ({context['adx_label']})\n"
+            f"🔥 Body ratio:  {context['body_ratio']:.2f}  ({context['body_label']})\n"
+            f"📈 MACD hist:   {context['macd_hist_dir']}\n"
+            f"🧭 HTF 4H:      {context['htf_label']}  ({context['htf_close']:.0f} {context['htf_relation']} EMA50 {context['htf_ema50']:.0f}, {context['htf_diff_pct']:+.2f}%)\n\n"
+            f"Confianza: {context['confidence_pct']}%\n"
+            f"━━━ Sizing sugerido (para equity {context['equity']:.0f} USDT) ━━━\n"
+            f"💰 Risk:        {context['risk_usd']:.2f} USDT (1.5% equity)\n"
+            f"📏 SL distance: {context['risk_pct']:.2f}%\n"
+            f"📦 Position:    {context['position_usd']:.2f} USDT notional\n"
+            f"⚙️ Leverage:    {context['leverage']:.2f}x (cap {context['leverage_cap']:.1f}x)\n"
+            f"🔢 Qty:         {context['qty']:.5f} BTC\n\n"
+            f"Stop confirmado en {context['pivot_kind']} barra -{context['pivot_offset']}"
+        )
+        return self.send_html(message)
+
+    def send_exit_notification(self, signal: Any, context: dict[str, Any]) -> bool:
+        direction = context["signal_type"]
+        exit_type = context["exit_type"]
+        icon = "🎯" if exit_type == "tp" else "❌"
+        cooldown_icon = "🟢" if exit_type == "tp" else "🔴"
+        cooldown_until_bar = context.get("cooldown_until_bar", "?")
+        message = (
+            f"{icon} <b>{direction} CERRADO en {exit_type.upper()} | {signal.symbol} 15m</b>\n\n"
+            f"Entrada: <code>{context['entry_price']:.2f}</code> ({context['entry_time_label']})\n"
+            f"Salida:  <code>{context['exit_price']:.2f}</code> ({context['exit_time_label']})\n\n"
+            f"PnL:     <code>{context['pnl_pct']:+.2f}% | {context['pnl_usd']:+.2f} USDT</code> (con {context['leverage']:.2f}x lev)\n"
+            f"Tiempo:  <code>{context['duration_label']}</code> ({context['bars_held']} barras)\n\n"
+            f"{cooldown_icon} Trade cerrado — cooldown {context['cooldown_bars']} barras (hasta bar {cooldown_until_bar})"
+        )
+        return self.send_html(message)
+
+    def send_lifecycle_notification(self, event_type: str, payload: dict[str, Any]) -> bool:
+        if event_type == "start":
+            message = (
+                f"🚀 <b>TrendBot Signal Service iniciado | {payload['symbol']} {payload['interval']}</b>\n"
+                f"Equity paper: {payload['equity']:.2f} USDT\n"
+                f"HTF bias: {payload['htf_bias']}\n"
+                f"Bootstrap: {payload['bootstrap_bars']} velas cargadas"
+            )
+        elif event_type == "stop":
+            message = (
+                "🛑 <b>TrendBot Signal Service detenido</b>\n"
+                f"Procesadas: {payload['bars_processed']} velas | Señales: {payload['signals']} | Cierres: {payload['closures']}\n"
+                f"Uptime: {payload['uptime_label']}"
+            )
+        elif event_type == "api_error":
+            message = (
+                f"⚠️ <b>API BingX caída — {payload['failures']} fallos consecutivos</b>\n"
+                f"Último error: {payload['error_message']}\n"
+                "Servicio sigue corriendo, intentando reconectar..."
+            )
+        else:
+            message = str(payload.get("message", ""))
+        return self.send_html(message)
+
+    def send_daily_summary(self, summary: dict[str, Any]) -> bool:
+        if summary.get("idle"):
+            message = (
+                f"📊 <b>Resumen {summary['date']} UTC</b>\n\n"
+                "Sin señales ni cierres hoy. Servicio healthy."
+            )
+        else:
+            message = (
+                f"📊 <b>Resumen {summary['date']} UTC</b>\n\n"
+                f"Señales emitidas: {summary['signals']} ({summary['longs']} LONG, {summary['shorts']} SHORT)\n"
+                f"Cierres: {summary['closures']} ({summary['tp']} TP, {summary['sl']} SL)\n"
+                f"PnL total del día: {summary['pnl_usd']:+.2f} USDT ({summary['pnl_pct']:+.2f}%)\n"
+                f"Velas procesadas: {summary['bars_processed']}/96 ({summary['uptime_pct']:.0f}% uptime)"
+            )
+        return self.send_html(message)
 
 
 # ── Util ──────────────────────────────────────────────────────────────────────

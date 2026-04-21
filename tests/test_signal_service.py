@@ -62,7 +62,23 @@ class _FakeClient:
 class _FakeTelegram:
     messages: list[str]
 
-    def send(self, text: str) -> bool:
+    def send_entry_notification(self, signal, context) -> bool:
+        self.messages.append(f"ENTRY:{context['signal_type']}")
+        return True
+
+    def send_exit_notification(self, signal, context) -> bool:
+        self.messages.append(f"EXIT:{context['signal_type']}:{context['exit_type']}")
+        return True
+
+    def send_lifecycle_notification(self, event_type: str, payload: dict) -> bool:
+        self.messages.append(f"LIFE:{event_type}")
+        return True
+
+    def send_daily_summary(self, summary: dict) -> bool:
+        self.messages.append(f"SUMMARY:{summary['date']}")
+        return True
+
+    def send_html(self, text: str) -> bool:
         self.messages.append(text)
         return True
 
@@ -156,11 +172,10 @@ def test_signal_service_end_to_end_writes_csv_and_formats_message(tmp_path, monk
     summary = service.run_once()
 
     assert startup.startup is True
-    assert "Signal Service started" in telegram.messages[0]
+    assert telegram.messages[0] == "LIFE:start"
     assert summary.signals_emitted == 1
     assert len(telegram.messages) == 2
-    assert "LONG BTC-USDT 15m" in telegram.messages[1]
-    assert "Sizing sugerido" in telegram.messages[1]
+    assert telegram.messages[1] == "ENTRY:LONG"
 
     csv_lines = config.csv_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(csv_lines) == 2
@@ -251,8 +266,9 @@ def test_signal_service_sends_hourly_heartbeat_once_per_hour(tmp_path):
     assert first is True
     assert second is False
     assert third is True
-    assert len(telegram.messages) == 3
-    assert "Signal Service heartbeat" in telegram.messages[1]
+    assert len(telegram.messages) == 4
+    assert telegram.messages[1].startswith("SUMMARY:")
+    assert telegram.messages[2] == "LIFE:heartbeat"
 
 
 def test_signal_service_stop_persists_state_and_notifies(tmp_path):
@@ -282,4 +298,4 @@ def test_signal_service_stop_persists_state_and_notifies(tmp_path):
     assert state["interval"] == "15m"
     assert state["bootstrapped"] is True
     assert state["total_bars_processed"] >= 300
-    assert "Signal Service stopped" in telegram.messages[-1]
+    assert telegram.messages[-1] == "LIFE:stop"
